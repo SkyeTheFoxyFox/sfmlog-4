@@ -11,7 +11,7 @@ class SFMlog:
     def transpile(self, code: str, cwd: pathlib.Path) -> str:
         tokenizer = _tokenizer(code)
         parser = _parser(tokenizer.tokens, cwd)
-        executer = _executer(parser.code, parser.macros, parser.functions, "")
+        executer = _executer(parser.code, "")
         executer.execute()
         return _tokenizer.token_list_to_str(executer.output)
 
@@ -175,38 +175,16 @@ class _tokenizer:
         return string
 
 class _parser:
-    class macro:
-        def __init__(self, name: str, code: list[_tokenizer.token], args: list[str]):
-            self.name = name
-            self.code = code
-            self.args = args
-            self.run_count = 0
-
-        def __repr__(self):
-            return f"macro({self.name})"
-
-    class function:
-        def __init__(self, name: str, code: list[_tokenizer.token], args: list[str]):
-            self.name = name
-            self.code = code
-            self.args = args
-
-        def __repr__(self):
-            return f"function({self.name})"
 
     def __init__(self, code: list[_tokenizer.token], cwd: pathlib.Path):
         self.cwd = cwd
         self.code = code
-        self.macros = {}
-        self.functions = {}
         self.imports = []
 
         self.parse()
 
     def parse(self):
         self.get_imports()
-        self.get_macros()
-        self.get_functions()
 
     def get_imports(self, in_code=None, cwd=None):
         if in_code is None:
@@ -236,56 +214,6 @@ class _parser:
 
             line = self.read_line(code_iter)
 
-    def get_macros(self):
-        code_iter = iter(self.code)
-        code = []
-        line = self.read_line(code_iter)
-        while line != []:
-            if self.list_get_token(line, 0).value == "defmac":
-                mac_line = self.read_line(code_iter)
-                mac_code = []
-                while True:
-                    if mac_line == []:
-                        _error("Macro not closed", self.list_get_token(line, 0))
-                    elif self.list_get_token(mac_line, 0).value == "endmac":
-                        break
-                    else:
-                        mac_code.extend(mac_line)
-                    mac_line = self.read_line(code_iter)
-                macro = self.macro(self.list_get_token(line, 1).value, mac_code, line[2:-1])
-                self.macros[macro.name] = macro
-            elif self.list_get_token(line, 0).value == "endmac":
-                _error("Unexpected endmac while not defining macro", self.list_get_token(line, 0))
-            else:
-                code.extend(line)
-            line = self.read_line(code_iter)
-        self.code = code
-
-    def get_functions(self):
-        code_iter = iter(self.code)
-        code = []
-        line = self.read_line(code_iter)
-        while line != []:
-            if self.list_get_token(line, 0).value == "deffun":
-                fun_line = self.read_line(code_iter)
-                fun_code = []
-                while True:
-                    if fun_line == []:
-                        _error("Function not closed", self.list_get_token(line, 0))
-                    elif self.list_get_token(fun_line, 0).value == "endfun":
-                        break
-                    else:
-                        fun_code.extend(fun_line)
-                    fun_line = self.read_line(code_iter)
-                function = self.function(self.list_get_token(line, 1).value, fun_code, line[2:-1])
-                self.functions[function.name] = function
-            elif self.list_get_token(line, 0).value == "endfun":
-                _error("Unexpected endfun while not defining function", self.list_get_token(line, 0))
-            else:
-                code.extend(line)
-            line = self.read_line(code_iter)
-        self.code = code
-
     def read_line(self, code_iter) -> list[_tokenizer.token]:
         line = []
         try:
@@ -308,17 +236,24 @@ class _parser:
         return token
 
 class _executer:
-    def __init__(self, code: list[_tokenizer.token], macros: dict[str,_parser.macro], functions: dict[str,_parser.function], scope_str: str, called_functions: list[str] = None):
+    class Macro:
+        def __init__(self, name, code, args):
+            self.name: str = name
+            self.code: list[_tokenizer.token] = code
+            self.args: list[str] = args
+            self.run_count = 0
+
+    class Processor:
+        def __init__(self, code, links):
+            self.code = code
+            self.links = links
+
+    def __init__(self, code: list[_tokenizer.token], scope_str: str):
         self.code: list[_tokenizer.token] = code
         self.instructions = self.read_lines()
         self.output: list[_tokenizer.token] = []
         self.scope_str = scope_str
-        self.macros: dict[str,_parser.macro] = macros
-        self.functions: dict[str, _parser.function] = functions
-        if called_functions is None:
-            self.called_functions: list[str] = []
-        else:
-            self.called_functions: list[str] = called_functions
+        self.macros: dict[str, Macro] = {}
         self.vars: dict[str, _tokenizer.token] = {}
 
         self.exec_pointer = 0
@@ -330,12 +265,32 @@ class _executer:
             inst = self.instructions[self.exec_pointer]
 
             match self.list_get_token(inst, 0).value:
+                case "proc":
+                    pass
+                case "repproc":
+                    pass
+                case "seqproc":
+                    pass
+                case "defmac":
+                    mac_code = self.read_till("endmac", ["defmac"])
+                    if mac_code is None:
+                        _error("'endmac' expected, but not found", inst[0])
+                    if self.list_get_token(inst, 1).type != "identifier":
+                        _error("Invalid name for macro", inst[1])
+                    if self.list_get_token(inst, 1).value in self.macros:
+                        _error(f"Macro '{inst[1].value}' already defined", inst[1])
+                    mac_args = []
+                    for arg in inst[2:-1]:
+                        if arg.type != "identifier":
+                            _error("Invalid name for macro argument", arg)
+                        mac_args.append(str(arg))
+                    self.macros[inst[1].value] = self.Macro(inst[1].value, mac_code, mac_args)
                 case "mac":
                     if self.list_get_token(inst, 1).value in self.macros:
                         mac = self.macros[self.list_get_token(inst, 1).value]
-                        mac_executer = _executer(mac.code, self.macros, self.functions, f"_{mac.name}_{mac.run_count}_", self.called_functions)
+                        mac_executer = _executer(mac.code, f"_{mac.name}_{mac.run_count}_")
                         for index, arg in enumerate(mac.args):
-                            var_token = self.list_get_token(inst, index + 2)
+                            var_token = self.list_get_token(inst, index + 2, f"Macro '{mac.name}' expected more arguments")
                             if var_token.type in ["identifier", "global_identifier"] and str(var_token) in self.vars:
                                 mac_executer.vars[str(arg)] = self.vars[str(var_token)]
                             else:
@@ -346,18 +301,6 @@ class _executer:
                         self.output.extend(mac_executer.output)
                     else:
                         _error(f"Unknown macro '{self.list_get_token(inst, 1).value}'", self.list_get_token(inst, 1))
-                #case "fun":
-                #    function_name = self.list_get_token(inst, 1).value
-                #    if function_name.value in self.functions:
-                #        if function_name.value not in self.called_functions:
-                #            self.called_functions.append(function_name.value)
-                #        function = self.functions[function_name.value]
-                #        for arg in function.args:
-                #            self.extend([_parser.token("instruction", "set", ), ])
-                #        ##type: str, value, line: int, column: int, scope = None
-                #        #self.extend([_parser.token("instruction", "")])
-                #    else:
-                #        _error(f"Unknown function '{function_name.value}'", function_name)
                 case "pset":
                     self.vars[str(self.list_get_token(inst, 1))] = self.list_get_token(inst, 2)
                 case _:
@@ -368,6 +311,20 @@ class _executer:
                             self.output.append(token.with_scope(self.scope_str))
 
             self.exec_pointer += 1
+
+    def read_till(self, till: str, error: list[str]) -> list[_tokenizer.token] | None: #none if error
+        instructions = []
+        while True:
+            self.exec_pointer += 1
+            inst = self.instructions[self.exec_pointer]
+            if self.list_get_token(inst, 0).value in error:
+                return None
+            elif self.exec_pointer >= len(self.instructions):
+                return None
+            elif self.list_get_token(inst, 0).value == till:
+                return instructions
+            instructions.extend(inst)
+        self.exec_pointer += 1
 
     def read_lines(self) -> list[list[_tokenizer.token]]:
         lines = []
@@ -381,13 +338,13 @@ class _executer:
                 line.append(token)
         return lines
 
-    def list_get_token(self, token_list: list[_tokenizer.token], index: int):
+    def list_get_token(self, token_list: list[_tokenizer.token], index: int, error: str = "Unexpected end of line"):
         try:
             token = token_list[index]
         except IndexError:
-            _error("Unexpected end of line", token_list[-1])
+            _error(error, token_list[-1])
         if token.type == "line_break":
-            _error("Unexpected end of line", token)
+            _error(error, token)
         return token
 
 if __name__ == "__main__":
