@@ -241,7 +241,6 @@ class _executer:
             self.name: str = name
             self.code: list[_tokenizer.token] = code
             self.args: list[str] = args
-            self.run_count = 0
 
     class Processor:
         def __init__(self, code, links):
@@ -254,6 +253,7 @@ class _executer:
         self.output: list[_tokenizer.token] = []
         self.scope_str = scope_str
         self.macros: dict[str, Macro] = {}
+        self.macro_run_counts: dict[str, int] = {}
         self.vars: dict[str, _tokenizer.token] = {}
 
         self.exec_pointer = 0
@@ -275,10 +275,10 @@ class _executer:
                     mac_code = self.read_till("endmac", ["defmac"])
                     if mac_code is None:
                         _error("'endmac' expected, but not found", inst[0])
+                    if type(mac_code) != list:
+                        _error("Unexpected 'endmac' found", mac_code)
                     if self.list_get_token(inst, 1).type != "identifier":
                         _error("Invalid name for macro", inst[1])
-                    if self.list_get_token(inst, 1).value in self.macros:
-                        _error(f"Macro '{inst[1].value}' already defined", inst[1])
                     mac_args = []
                     for arg in inst[2:-1]:
                         if arg.type != "identifier":
@@ -288,15 +288,18 @@ class _executer:
                 case "mac":
                     if self.list_get_token(inst, 1).value in self.macros:
                         mac = self.macros[self.list_get_token(inst, 1).value]
-                        mac_executer = _executer(mac.code, f"_{mac.name}_{mac.run_count}_")
+                        if mac.name not in self.macro_run_counts:
+                            self.macro_run_counts[mac.name] = 0
+                        mac_executer = _executer(mac.code, f"{self.scope_str}{mac.name}_{self.macro_run_counts[mac.name]}_")
                         for index, arg in enumerate(mac.args):
                             var_token = self.list_get_token(inst, index + 2, f"Macro '{mac.name}' expected more arguments")
                             if var_token.type in ["identifier", "global_identifier"] and str(var_token) in self.vars:
                                 mac_executer.vars[str(arg)] = self.vars[str(var_token)]
                             else:
                                 mac_executer.vars[str(arg)] = var_token.with_scope(self.scope_str)
+                        mac_executer.macros = self.macros.copy()
 
-                        mac.run_count += 1
+                        self.macro_run_counts[mac.name] += 1
                         mac_executer.execute()
                         self.output.extend(mac_executer.output)
                     else:
@@ -312,16 +315,21 @@ class _executer:
 
             self.exec_pointer += 1
 
-    def read_till(self, till: str, error: list[str]) -> list[_tokenizer.token] | None: #none if error
+    def read_till(self, end_word: str, start_word: list[str]) -> list[_tokenizer.token] | None | _tokenizer.token: #None if eof, token if unexpected end
         instructions = []
+        level = 0
         while True:
             self.exec_pointer += 1
             inst = self.instructions[self.exec_pointer]
-            if self.list_get_token(inst, 0).value in error:
-                return None
-            elif self.exec_pointer >= len(self.instructions):
-                return None
-            elif self.list_get_token(inst, 0).value == till:
+            if self.exec_pointer >= len(self.instructions):
+                return 1
+            elif self.list_get_token(inst, 0).value in start_word:
+                level += 1
+            elif self.list_get_token(inst, 0).value == end_word and level > 0:
+                level -= 1
+            elif self.list_get_token(inst, 0).value == end_word and level < 0:
+                return 2
+            elif self.list_get_token(inst, 0).value == end_word and level == 0:
                 return instructions
             instructions.extend(inst)
         self.exec_pointer += 1
