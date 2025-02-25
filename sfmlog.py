@@ -1,4 +1,4 @@
-import sys, argparse, pathlib, re
+import sys, argparse, pathlib, re, pymsch, math
 
 def _error(text: str, token):
     print(f"ERROR at ({token.line},{token.column}): {text}")
@@ -11,9 +11,12 @@ class SFMlog:
     def transpile(self, code: str, cwd: pathlib.Path) -> str:
         tokenizer = _tokenizer(code)
         parser = _parser(tokenizer.tokens, cwd)
-        executer = _executer(parser.code, "")
+        schem_builder = _schem_builder()
+        executer = _executer(parser.code, {}, "_", schem_builder)
+        executer.as_root_level()
         executer.execute()
-        return _tokenizer.token_list_to_str(executer.output)
+        schem_builder.make_schem()
+        return schem_builder.schem
 
 class _tokenizer:
     SUB_INSTRUCTION_MAP = {
@@ -61,6 +64,8 @@ class _tokenizer:
         def __str__(self):
             if self.type in ["identifier", "label"]:
                 return str(self.scope) + str(self.value)
+            elif self.type == "global_identifier":
+                return f"global_{str(self.value)}"
             else:
                 return str(self.value)
 
@@ -236,18 +241,15 @@ class _parser:
         return token
 
 class _executer:
+    PROC_INSTRUCTIONS = ["proc", "repproc", "seqproc"]
+
     class Macro:
         def __init__(self, name, code, args):
             self.name: str = name
             self.code: list[_tokenizer.token] = code
-            self.args: list[str] = args
+            self.args: list[_tokenizer.token] = args
 
-    class Processor:
-        def __init__(self, code, links):
-            self.code = code
-            self.links = links
-
-    def __init__(self, code: list[_tokenizer.token], scope_str: str):
+    def __init__(self, code: list[_tokenizer.token], global_vars: dict[str, _tokenizer.token], scope_str: str, schem_builder):
         self.code: list[_tokenizer.token] = code
         self.instructions = self.read_lines()
         self.output: list[_tokenizer.token] = []
@@ -255,6 +257,10 @@ class _executer:
         self.macros: dict[str, Macro] = {}
         self.macro_run_counts: dict[str, int] = {}
         self.vars: dict[str, _tokenizer.token] = {}
+        self.global_vars: dict[str, _tokenizer.token] = global_vars
+        self.allow_mlog = True
+        self.is_root = False
+        self.schem_builder = schem_builder
 
         self.exec_pointer = 0
 
@@ -265,11 +271,39 @@ class _executer:
             inst = self.instructions[self.exec_pointer]
 
             match self.list_get_token(inst, 0).value:
+                case "block":
+                    var_name = self.list_get_token(inst, 1)
+                    if var_name.type not in ["identifier", "global_identifier"]:
+                        _error("Invalid variable name", var_name)
+                    block_type = self.list_get_token(inst, 2)
+                    if block_type.type != "content_literal":
+                        _error("Expected block type", block_type)
+                    block_pos = None
+                    block_rot = 0
+                    if len(inst) > 5:
+                        if type(self.resolve_var(inst[3]).value) != float:
+                            _error("Expected numeric value", inst[3])
+                        if type(self.resolve_var(inst[4]).value) != float:
+                            _error("Expected numeric value", inst[4])
+                        block_pos = (int(self.resolve_var(inst[3]).value), int(self.resolve_var(inst[4]).value))
+                    if len(inst) > 6:
+                        if type(self.resolve_var(inst[5]).value) != float:
+                            _error("Expected numeric value", inst[5])
+                        block_rot = int(self.resolve_var(inst[5]).value)
+
+                    block = self.schem_builder.Block(inst, block_type, block_pos, block_rot)
+                    link_name = self.schem_builder.add_block(block)
+                    self.write_var(var_name, _tokenizer.token("block_var", link_name, 0, 0))
                 case "proc":
-                    pass
+                    proc_code = self.read_till("endproc", self.PROC_INSTRUCTIONS)
+                    if proc_code is None:
+                        _error("'endproc' expected, but not found", inst[0])
+                    if type(proc_code) != list:
+                        _error("Unexpected 'endproc' found", proc_code)
+                    proc_executer = _executer(proc_code, self.global_vars, "_", self.schem_builder)
+                    proc_executer.execute()
+                    self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output)))
                 case "repproc":
-                    pass
-                case "seqproc":
                     pass
                 case "defmac":
                     mac_code = self.read_till("endmac", ["defmac"])
@@ -283,20 +317,17 @@ class _executer:
                     for arg in inst[2:-1]:
                         if arg.type != "identifier":
                             _error("Invalid name for macro argument", arg)
-                        mac_args.append(str(arg))
+                        mac_args.append(arg)
                     self.macros[inst[1].value] = self.Macro(inst[1].value, mac_code, mac_args)
                 case "mac":
                     if self.list_get_token(inst, 1).value in self.macros:
                         mac = self.macros[self.list_get_token(inst, 1).value]
                         if mac.name not in self.macro_run_counts:
                             self.macro_run_counts[mac.name] = 0
-                        mac_executer = _executer(mac.code, f"{self.scope_str}{mac.name}_{self.macro_run_counts[mac.name]}_")
+                        mac_executer = _executer(mac.code, self.global_vars, f"{self.scope_str}{mac.name}_{self.macro_run_counts[mac.name]}_", self.schem_builder)
                         for index, arg in enumerate(mac.args):
                             var_token = self.list_get_token(inst, index + 2, f"Macro '{mac.name}' expected more arguments")
-                            if var_token.type in ["identifier", "global_identifier"] and str(var_token) in self.vars:
-                                mac_executer.vars[str(arg)] = self.vars[str(var_token)]
-                            else:
-                                mac_executer.vars[str(arg)] = var_token.with_scope(self.scope_str)
+                            mac_executer.write_var(arg, self.resolve_var(var_token))
                         mac_executer.macros = self.macros.copy()
 
                         self.macro_run_counts[mac.name] += 1
@@ -305,15 +336,25 @@ class _executer:
                     else:
                         _error(f"Unknown macro '{self.list_get_token(inst, 1).value}'", self.list_get_token(inst, 1))
                 case "pset":
-                    self.vars[str(self.list_get_token(inst, 1))] = self.list_get_token(inst, 2)
+                    self.write_var(self.list_get_token(inst, 1), self.resolve_var(self.list_get_token(inst, 2)))
                 case _:
                     for token in inst:
-                        if str(token) in self.vars:
-                            self.output.append(self.vars[str(token)].with_scope(self.scope_str).at_pos((token.line, token.column)))
-                        else:
-                            self.output.append(token.with_scope(self.scope_str))
-
+                        self.output.append(self.resolve_var(token))
+            if len(self.output) > 0 and not self.allow_mlog:
+                _error("Mlog instructions not allowed outside a 'proc' statement", inst[0])
             self.exec_pointer += 1
+        if self.allow_mlog and self.is_root:
+            self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(self.output)))
+        if self.is_root:
+            self.schem_builder.processor_type = self.global_vars["global_PROCESSOR_TYPE"]
+
+    def check_for_proc(self) -> bool:
+        for line in self.read_lines():
+            if line[0].value in self.PROC_INSTRUCTIONS:
+                break
+        else:
+            return False
+        return True
 
     def read_till(self, end_word: str, start_word: list[str]) -> list[_tokenizer.token] | None | _tokenizer.token: #None if eof, token if unexpected end
         instructions = []
@@ -355,6 +396,151 @@ class _executer:
             _error(error, token)
         return token
 
+    def as_root_level(self):
+        self.allow_mlog = not self.check_for_proc()
+        self.is_root = True
+        self.global_vars["global_PROCESSOR_TYPE"] = _tokenizer.token("content_literal", "@micro-processor", 0, 0)
+
+    def resolve_var(self, name: _tokenizer.token):
+        if name.type == "identifier" and str(name) in self.vars:
+            return self.vars[str(name)].with_scope(self.scope_str).at_pos((name.line, name.column))
+        elif name.type == "global_identifier" and str(name) in self.global_vars:
+            return self.global_vars[str(name)].with_scope("").at_pos((name.line, name.column))
+        else:
+            return name.with_scope(self.scope_str)
+
+    def write_var(self, name: _tokenizer.token, value: _tokenizer.token):
+        if name.type == "identifier":
+            self.vars[str(name)] = value
+        elif name.type == "global_identifier":
+            self.global_vars[str(name)] = value
+        else:
+            return False
+        return True
+
+
+class _schem_builder:
+    class Proc:
+        def __init__(self, code):
+            self.code: str = code
+
+    class Block:
+        def __init__(self, inst: _tokenizer.token, type: _tokenizer.token, pos: tuple[int, int]|None, rot: int):
+            self.inst = inst
+            self.type_name = type.value[1:]
+            self.type_token = type
+            self.pos = pos
+            self.rotation = rot
+            self.link_name = ""
+
+    def __init__(self):
+        self.procs = []
+        self.proc_positions = []
+        self.placed_procs = []
+        self.blocks = []
+        self.link_counts = {}
+        self.processor_type = None
+        self.schem = pymsch.Schematic()
+
+    def add_proc(self, proc):
+        self.procs.append(proc)
+
+    def add_block(self, block):
+        name = self.get_link_name(block.type_name)
+        block.link_name = name
+        self.blocks.append(block)
+        return name
+
+    def get_link_name(self, type: str):
+        words = type.split('-')
+        name = words[-2] if words[-1] == "large" else words[-1]
+        if name in self.link_counts:
+            self.link_counts[name] += 1
+            name += str(self.link_counts[name])
+        else:
+            self.link_counts[name] = 1
+            name += "1"
+        return name
+
+    def make_schem(self):
+        self.schem_add_blocks()
+        self.schem_add_procs()
+
+    def schem_add_blocks(self):
+        block_x = 0
+        for block in self.blocks:
+            for char in block.type_name:
+                if char in "_ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                    _error("Unknown block type", block.type_token)
+            block_type_name = block.type_name.upper().replace('-', '_')
+            if block_type_name in ["micro-processor", "logic-processor", "hyper-processor", "world-processor"]:
+                _error("Block type must not be a processor, use 'proc'")
+            if block_type_name not in pymsch.Content.__members__:
+                _error("Unknown block type", block.type_token)
+            block_type = pymsch.Content[block_type_name]
+            
+            if block.pos is None:
+                while True:
+                    new_block = self.schem.add_block(pymsch.Block(block_type, block_x, -(block_type.value.size//2) - 1, None, 0))
+                    if new_block is not None:
+                        block.pos = (block_x, -(block_type.value.size//2) - 1)
+                        break
+                    block_x += 1
+                
+            else:
+                block = self.schem.add_block(pymsch.Block(block_type, block.pos[0], block.pos[1], None, block.rotation))
+                if block is None:
+                    _error("Specified position is blocked", block.inst)
+
+    def schem_add_procs(self):
+        if self.processor_type.value[1:] not in ["micro-processor", "logic-processor", "hyper-processor", "world-processor"]:
+            _error("Unknown processor type", self.processor_type)
+        proc_type = pymsch.Content[self.processor_type.value[1:].upper().replace('-', '_')]
+        proc_size = proc_type.value.size
+        square_size = math.ceil(math.sqrt(len(self.procs))) * proc_size
+        while self.schem_count_filled_blocks(proc_size, square_size) + len(self.procs) > square_size**2:
+            square_size += 1
+        proc_x = math.ceil(proc_size/2) -1
+        proc_y = math.ceil(proc_size/2) -1
+        for proc in self.procs:
+            while True:
+                if proc_x >= square_size:
+                    proc_x = math.ceil(proc_size/2) -1
+                    proc_y += proc_size
+                proc_conf = pymsch.ProcessorConfig(proc.code, [])
+                block = self.schem.add_block(pymsch.Block(proc_type, proc_x, proc_y, proc_conf, 0))
+                if block is None:
+                    proc_x += proc_size
+                else:
+                    self.proc_positions.append((proc_x, proc_y))
+                    self.placed_procs.append(block)
+                    break
+            proc_x += proc_size
+        for proc in self.placed_procs:
+            self.set_proc_links(proc.config, (proc.x, proc.y))
+
+
+    def schem_count_filled_blocks(self, proc_size, square_size):
+        count = 0
+        for x in range(square_size):
+            for y in range(square_size):
+                inc = 0
+                for px in range(proc_size):
+                    for py in range(proc_size):
+                        if (x*proc_size + px, y*proc_size + py) in self.schem._filled_list:
+                            inc = 1
+                            break
+                count += inc
+        return count
+
+    def set_proc_links(self, proc, proc_pos):
+        for block in self.blocks:
+            proc.links.append(pymsch.ProcessorLink(block.pos[0] - proc_pos[0], block.pos[1] - proc_pos[1], block.link_name))
+        for index, iter_proc in enumerate(self.proc_positions):
+            proc.links.append(pymsch.ProcessorLink(iter_proc[0] - proc_pos[0], iter_proc[1] - proc_pos[1], f"processor{index+1}"))
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog='sfmlog', description='A mindustry transpiler', epilog=':hognar:')
     parser.add_argument('-s', '--src', required=True, type=pathlib.Path, help="the file to transpile", metavar="source_file")
@@ -365,10 +551,9 @@ if __name__ == "__main__":
         code = f.read()
 
     transpiler = SFMlog()
-    out_code = transpiler.transpile(code, args.src.parent)
+    out_schem = transpiler.transpile(code, args.src.parent)
 
-    print(out_code)
+    print(out_schem)
 
     if args.copy:
-        import pyperclip
-        pyperclip.copy(out_code)
+        out_schem.write_clipboard()
