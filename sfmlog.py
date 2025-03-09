@@ -1,18 +1,26 @@
 import sys, argparse, pathlib, re, pymsch, math, random
 
 def _error(text: str, token):
-    print(f"ERROR at ({token.line},{token.column}): {text}")
+    if token.file is None:
+        print(f"ERROR at ({token.line},{token.column}): {text}")
+    else:
+        print(f"ERROR at ({token.line},{token.column}) in '{token.file}': {text}")
     sys.exit(2)
+
+def _warning(text: str, token):
+    if token.file is None:
+        print(f"WARNING at ({token.line},{token.column}): {text}")
+    else:
+        print(f"WARNING at ({token.line},{token.column}) in '{token.file}': {text}")
 
 class SFMlog:
     def __init__(self):
         pass
 
-    def transpile(self, code: str, cwd: pathlib.Path) -> str:
-        tokenizer = _tokenizer(code)
-        parser = _parser(tokenizer.tokens, cwd)
+    def transpile(self, code: str, file: pathlib.Path) -> str:
+        tokenizer = _tokenizer(code, file)
         schem_builder = _schem_builder()
-        executer = _executer(parser.code, {}, "_", schem_builder)
+        executer = _executer(tokenizer.tokens, file.parent, {}, "_", schem_builder)
         executer.as_root_level()
         executer.execute()
         schem_builder.make_schem()
@@ -48,11 +56,12 @@ class _tokenizer:
     LINK_BLOCKS = ["gate", "foundation", "wall", "container", "afflict", "heater", "conveyor", "duct", "press", "tower", "pad", "projector", "swarmer", "factory", "drill", "router", "door", "illuminator", "processor", "sorter", "spectre", "parallax", "cell", "electrolyzer", "display", "chamber", "mixer", "conduit", "distributor", "crucible", "message", "unloader", "refabricator", "switch", "bore", "bank", "accelerator", "disperse", "vault", "point", "nucleus", "panel", "node", "condenser", "smelter", "pump", "generator", "tank", "reactor", "cultivator", "malign", "synthesizer", "deconstructor", "meltdown", "centrifuge", "radar", "driver", "void", "junction", "diffuse", "pulverizer", "salvo", "bridge", "acropolis", "dome", "reconstructor", "separator", "citadel", "concentrator", "mender", "lancer", "source", "loader", "duo", "melter", "crusher", "fabricator", "redirector", "disassembler", "gigantic", "incinerator", "scorch", "battery", "tsunami", "arc", "compressor", "assembler", "smite", "module", "bastion", "segment", "constructor", "ripple", "furnace", "wave", "foreshadow", "link", "mine", "scathe", "canvas", "diode", "extractor", "fuse", "kiln", "sublimate", "scatter", "cyclone", "titan", "turret", "lustre", "thruster", "shard", "weaver", "huge", "breach", "hail"]
 
     class token:
-        def __init__(self, type: str, value, line: int = 0, column: int = 0, scope = None):
+        def __init__(self, type: str, value, line: int = 0, column: int = 0, file: pathlib.Path = None, scope = None):
             self.type: str = type
             self.value = value
             self.line = line
             self.column = column
+            self.file = file
             self.scope = scope
 
         def __repr__(self):
@@ -71,12 +80,15 @@ class _tokenizer:
 
         def with_scope(self, scope: str):
             if self.scope == None:
-                return _tokenizer.token(self.type, self.value, self.line, self.column, scope=scope)
+                return _tokenizer.token(self.type, self.value, self.line, self.column, self.file, scope=scope)
             else:
                 return self
 
         def at_pos(self, pos: tuple[int, int]):
-            return _tokenizer.token(self.type, self.value, pos[0], pos[1], scope=self.scope)
+            return _tokenizer.token(self.type, self.value, pos[0], pos[1], self.file, scope=self.scope)
+
+        def at_token(self, token):
+            return _tokenizer.token(self.type, self.value, token.line, token.column, token.file , scope=self.scope)
 
         def resolve_string(self):
             if self.type == "string":
@@ -84,10 +96,10 @@ class _tokenizer:
             else:
                 return self.value
 
-    def __init__(self, code: str):
-        self.tokens: list[token] = self.tokenize(code)
+    def __init__(self, code: str, file: pathlib.Path):
+        self.tokens: list[token] = self.tokenize(code, file)
 
-    def tokenize(self, code: str) -> list[token]:
+    def tokenize(self, code: str, file: str) -> list[token]:
         tokens = []
         regex = r"(?:(?: |\t)+)|(?:\n+$)|(\n)\n*|(?:#.*)(?:\n|$)|(\".+?\")(?:\s*?$| )|(.+?)(?:\s*?$| )"
         prev_instruction = ""
@@ -113,9 +125,9 @@ class _tokenizer:
                     prev_instruction = match_string
                     dist_from_prev_instruction = 0
                 if not (token_type == "line_break" and prev_token_type == "line_break"):
-                    tokens.append(self.token(token_type, token_value, line + 1, column))
+                    tokens.append(self.token(token_type, token_value, line + 1, column, file))
                 prev_token_type = token_type
-        tokens.append(self.token("line_break", "\n", line + 1, column))
+        tokens.append(self.token("line_break", "\n", line + 1, column, file))
         return tokens
 
     def identify_token(self, string: str, prev_token_type: str, prev_instruction: str, dist_from_prev_instruction: int, pos: tuple[int, int]) -> tuple[str, str | float]:
@@ -176,7 +188,7 @@ class _tokenizer:
 
     def token_list_to_str(tokens: list[token]) -> str:
         string = ""
-        last_token = _tokenizer.token("line_break", "\n", 0, 0)
+        last_token = _tokenizer.token("line_break", "\n")
         for token in tokens:
             if token.type == "line_break" or last_token.type == "line_break":
                 string += str(token)
@@ -185,70 +197,13 @@ class _tokenizer:
             last_token = token
         return string
 
-class _parser:
-
-    def __init__(self, code: list[_tokenizer.token], cwd: pathlib.Path):
-        self.cwd = cwd
-        self.code = code
-        self.imports = []
-
-        self.parse()
-
-    def parse(self):
-        self.get_imports()
-
-    def get_imports(self, in_code=None, cwd=None):
-        if in_code is None:
-            in_code = self.code
-            self.code = []
-        if cwd is None:
-            cwd = self.cwd
-        code_iter = iter(in_code)
-        line = self.read_line(code_iter)
-        while line != []:
-            if self.list_get_token(line, 0).value == "import":
-                import_path = pathlib.Path(self.list_get_token(line, 1).resolve_string())
-                if not import_path.is_absolute():
-                    import_path = cwd / import_path
-                import_path = import_path.resolve()
-                if import_path not in self.imports:
-                    self.imports.append(import_path)
-                    try:
-                        with open(import_path, "r") as f:
-                            import_code = f.read()
-                    except FileNotFoundError:
-                        _error("File not found", self.list_get_token(line, 1))
-                    tokenizer = _tokenizer(import_code)
-                    self.get_imports(tokenizer.tokens, import_path.parent)
-            else:
-                self.code.extend(line)
-
-            line = self.read_line(code_iter)
-
-    def read_line(self, code_iter) -> list[_tokenizer.token]:
-        line = []
-        try:
-            token = next(code_iter)
-        except StopIteration:
-            return []
-        while token.type != "line_break":
-            line.append(token)
-            token = next(code_iter)
-        line.append(token)
-        return line
-
-    def list_get_token(self, token_list: list[_tokenizer.token], index: int):
-        try:
-            token = token_list[index]
-        except IndexError:
-            _error("Unexpected end of line", token_list[-1])
-        if token.type == "line_break":
-            _error("Unexpected end of line", token)
-        return token
-
 class _executer:
-    PROC_INSTRUCTIONS = ["proc", "repproc"]
     CONDITIONS = ["equal", "notEqual", "lessThan", "greaterThan", "lessThanEq", "greaterThanEq", "strictEqual"]
+    DEFAULT_GLOBALS = {
+        "PROCESSOR_TYPE":  _tokenizer.token("content_literal", "@micro-processor"),
+        "SCHEMATIC_NAME":  _tokenizer.token("string_literal", '"SFMlog Schematic"'),
+        "SCHEMATIC_DESCRIPTION": _tokenizer.token("string_literal", '"This schematic was generated using SFMlog."')
+    }
 
     class InstructionLine:
         def __init__(self, tokens):
@@ -265,7 +220,7 @@ class _executer:
 
         def option(self, index, default = None):
             if default is None:
-                default = _tokenizer.token("defined_literal", "null", self.tokens[-1].line, self.tokens[-1].column)
+                default = _tokenizer.token("defined_literal", "null").at_token(self.tokens[-1])
             try:
                 return self.tokens[index]
             except IndexError:
@@ -292,10 +247,11 @@ class _executer:
             self.code: list[_tokenizer.token] = code
             self.args: list[_tokenizer.token] = args
 
-    def __init__(self, code: list[_tokenizer.token], global_vars: dict[str, _tokenizer.token], scope_str: str, schem_builder):
+    def __init__(self, code: list[_tokenizer.token], cwd: pathlib.Path, global_vars: dict[str, _tokenizer.token], scope_str: str, schem_builder):
         self.code: list[_tokenizer.token] = code
         self.instructions = self.read_lines()
         self.output: list[_tokenizer.token] = []
+        self.cwd: pathlib.Path = cwd
         self.scope_str = scope_str
         self.macros: dict[str, Macro] = {}
         self.macro_run_counts: dict[str, int] = {}
@@ -314,6 +270,27 @@ class _executer:
             inst = self.instructions[self.exec_pointer]
 
             match inst[0].value:
+                case "import":
+                    import_file = self.resolve_var(inst[1])
+                    if import_file.type == "string_literal":
+                        import_file = pathlib.Path(import_file.value[1:-1])
+                    else:
+                        import_file = pathlib.Path(str(import_file.value))
+                    if not import_file.is_absolute():
+                        import_file = self.cwd / import_file
+                    try:
+                        with open(import_file, "r") as file:
+                            import_code = file.read()
+                    except FileNotFoundError:
+                        _error(f"File '{import_file}' not found", inst[1])
+                    import_tokenizer = _tokenizer(import_code, import_file)
+                    import_executer = _executer(import_tokenizer.tokens , import_file.parent, self.global_vars, self.scope_str, self.schem_builder)
+                    import_executer.macros = self.macros
+                    import_executer.vars = self.vars
+                    import_executer.allow_mlog = self.allow_mlog
+                    import_executer.macro_run_counts = self.macro_run_counts
+                    import_executer.execute()
+                    self.output.extend(import_executer.output)
                 case "block":
                     var_name = inst[1]
                     if var_name.type not in ["identifier", "global_identifier"]:
@@ -336,23 +313,31 @@ class _executer:
 
                     block = self.schem_builder.Block(inst, block_type, block_pos, block_rot)
                     link_name = self.schem_builder.add_block(block)
-                    self.write_var(var_name, _tokenizer.token("block_var", link_name, 0, 0))
+                    self.write_var(var_name, _tokenizer.token("block_var", link_name))
                 case "proc":
-                    proc_code = self.read_till("endproc", self.PROC_INSTRUCTIONS)
+                    proc_code = self.read_till("endproc", ["proc"])
                     if proc_code is None:
                         _error("'endproc' expected, but not found", inst[0])
-                    proc_executer = _executer(proc_code, self.global_vars, "_", self.schem_builder)
+                    proc_executer = _executer(proc_code, self.cwd, self.global_vars, "_", self.schem_builder)
                     proc_executer.macros = self.macros
                     proc_executer.execute()
-                    if 3 in inst:
-                        pos = (inst[2], inst[3])
+                    if 4 in inst:
+                        proc_type = self.resolve_var(inst[2])
+                    elif 2 in inst:
+                        _error("Unable to define type of proc without defined position", inst[2])
+                    else:
+                        proc_type = None
+                    if 4 in inst:
+                        if self.resolve_var(inst[3]).type != "number":
+                            _error("Expected numeric value", inst[3])
+                        if self.resolve_var(inst[4]).type != "number":
+                            _error("Expected numeric value", inst[4])
+                        pos = (int(self.resolve_var(inst[3]).value), int(self.resolve_var(inst[4]).value))
                     else:
                         pos = None
-                    proc_name = self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos))
+                    proc_name = self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos, proc_type, inst))
                     if 1 in inst:
-                        self.write_var(inst[1], _tokenizer.token("block_var", proc_name, 0, 0))
-                case "repproc":
-                    pass
+                        self.write_var(inst[1], _tokenizer.token("block_var", proc_name))
                 case "defmac":
                     mac_code = self.read_till("endmac", ["defmac"])
                     if mac_code is None:
@@ -370,7 +355,7 @@ class _executer:
                         mac = self.macros[inst[1].value]
                         if mac.name not in self.macro_run_counts:
                             self.macro_run_counts[mac.name] = 0
-                        mac_executer = _executer(mac.code, self.global_vars, f"{self.scope_str}{mac.name}_{self.macro_run_counts[mac.name]}_", self.schem_builder)
+                        mac_executer = _executer(mac.code, self.cwd, self.global_vars, f"{self.scope_str}{mac.name}_{self.macro_run_counts[mac.name]}_", self.schem_builder)
                         for index, arg in enumerate(mac.args):
                             var_token = inst[index + 2]
                             mac_executer.write_var(arg, self.resolve_var(var_token))
@@ -392,7 +377,7 @@ class _executer:
 
                     for instruction, code_block in code_sections:
                         if instruction[0].value == "else" or self.eval_condition(instruction[1], self.resolve_var(instruction[2]), self.resolve_var(instruction.option(3))).value:
-                            block_executer = _executer(code_block, self.global_vars, self.scope_str, self.schem_builder)
+                            block_executer = _executer(code_block, self.cwd, self.global_vars, self.scope_str, self.schem_builder)
                             block_executer.macros = self.macros
                             block_executer.vars = self.vars
                             block_executer.allow_mlog = self.allow_mlog
@@ -405,7 +390,7 @@ class _executer:
                     if code_block is None:
                         _error("'endwhile' expected, but not found", inst[0])
                     while self.eval_condition(inst[1], self.resolve_var(inst[2]), self.resolve_var(inst.option(3))).value:
-                        block_executer = _executer(code_block, self.global_vars, self.scope_str, self.schem_builder)
+                        block_executer = _executer(code_block, self.cwd, self.global_vars, self.scope_str, self.schem_builder)
                         block_executer.macros = self.macros
                         block_executer.vars = self.vars
                         block_executer.allow_mlog = self.allow_mlog
@@ -428,7 +413,7 @@ class _executer:
 
                         for i in iter_range:
                             self.write_var(inst[2], _tokenizer.token("number", i))
-                            block_executer = _executer(code_block, self.global_vars, self.scope_str, self.schem_builder)
+                            block_executer = _executer(code_block, self.cwd, self.global_vars, self.scope_str, self.schem_builder)
                             block_executer.macros = self.macros
                             block_executer.vars = self.vars
                             block_executer.allow_mlog = self.allow_mlog
@@ -447,10 +432,12 @@ class _executer:
             self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(self.output), None))
         if self.is_root:
             self.schem_builder.processor_type = self.global_vars["global_PROCESSOR_TYPE"]
+            self.schem_builder.set_name(self.resolve_log(self.global_vars["global_SCHEMATIC_NAME"]))
+            self.schem_builder.set_desc(self.resolve_log(self.global_vars["global_SCHEMATIC_DESCRIPTION"]))
 
     def check_for_proc(self) -> bool:
         for inst in self.read_lines():
-            if inst[0].value in self.PROC_INSTRUCTIONS:
+            if inst[0].value == "proc":
                 break
         else:
             return False
@@ -518,19 +505,20 @@ class _executer:
     def as_root_level(self):
         self.allow_mlog = not self.check_for_proc()
         self.is_root = True
-        self.global_vars["global_PROCESSOR_TYPE"] = _tokenizer.token("content_literal", "@micro-processor", 0, 0)
+        for name, value in self.DEFAULT_GLOBALS.items():
+            self.global_vars[f"global_{name}"] = value
 
     def resolve_var(self, name: _tokenizer.token):
         if name.type == "identifier" and str(name) in self.vars:
-            return self.vars[str(name)].with_scope(self.scope_str).at_pos((name.line, name.column))
+            return self.vars[str(name)].with_scope(self.scope_str).at_token(name)
         elif name.type == "global_identifier" and str(name) in self.global_vars:
-            return self.global_vars[str(name)].with_scope("").at_pos((name.line, name.column))
+            return self.global_vars[str(name)].with_scope("").at_token(name)
         else:
             return name.with_scope(self.scope_str)
 
     def resolve_log(self, token: _tokenizer.token) -> str:
         if token.type == "string_literal":
-            return token.value[1:-1]
+            return token.value[1:-1].replace("\\n", "\n")
         else:
             return str(self.resolve_var(token))
 
@@ -685,9 +673,11 @@ class _executer:
 
 class _schem_builder:
     class Proc:
-        def __init__(self, code, pos):
+        def __init__(self, code, pos, proc_type, inst):
             self.code: str = code
             self.pos = pos
+            self.type = proc_type
+            self.inst = inst
 
     class Block:
         def __init__(self, inst: _tokenizer.token, type: _tokenizer.token, pos: tuple[int, int]|None, rot: int):
@@ -706,6 +696,12 @@ class _schem_builder:
         self.link_counts = {}
         self.processor_type = None
         self.schem = pymsch.Schematic()
+
+    def set_name(self, name):
+        self.schem.set_tag('name', name)
+
+    def set_desc(self, desc):
+        self.schem.set_tag('description', desc)
 
     def add_proc(self, proc):
         self.procs.append(proc)
@@ -754,21 +750,36 @@ class _schem_builder:
                     block_x += 1
                 
             else:
-                block = self.schem.add_block(pymsch.Block(block_type, block.pos[0], block.pos[1], None, block.rotation))
-                if block is None:
-                    _error("Specified position is blocked", block.inst)
+                placed_block = self.schem.add_block(pymsch.Block(block_type, block.pos[0], block.pos[1], None, block.rotation))
+                if placed_block is None:
+                    _warning(f"Specified position at {block.pos} is blocked", block.inst[0])
 
-    def schem_add_procs(self):
+    def schem_add_positioned_procs(self):
+        procs = [x for x in self.procs if x.pos is not None]
+        for proc in procs:
+            if proc.type.value[1:] not in ["micro-processor", "logic-processor", "hyper-processor", "world-processor"]:
+                _error("Unknown processor type", proc.type)
+            proc_type = pymsch.Content[proc.type.value[1:].upper().replace('-', '_')]
+            proc_conf = pymsch.ProcessorConfig(proc.code, [])
+            block = self.schem.add_block(pymsch.Block(proc_type, proc.pos[0], proc.pos[1], proc_conf, 0))
+            if block is not None:
+                self.proc_positions.append(proc.pos)
+                self.placed_procs.append(block)
+            else:
+                _warning(f"Specified position at {proc.pos} is blocked", proc.inst[0])
+
+    def schem_add_unpositioned_procs(self):
+        procs = [x for x in self.procs if x.pos is None]
         if self.processor_type.value[1:] not in ["micro-processor", "logic-processor", "hyper-processor", "world-processor"]:
             _error("Unknown processor type", self.processor_type)
         proc_type = pymsch.Content[self.processor_type.value[1:].upper().replace('-', '_')]
         proc_size = proc_type.value.size
-        square_size = math.ceil(math.sqrt(len(self.procs))) * proc_size
-        while self.schem_count_filled_blocks(proc_size, square_size) + len(self.procs) > square_size**2:
+        square_size = math.ceil(math.sqrt(len(procs))) * proc_size
+        while self.schem_count_filled_blocks(proc_size, square_size) + len(procs) > square_size**2:
             square_size += 1
         proc_x = math.ceil(proc_size/2) -1
         proc_y = math.ceil(proc_size/2) -1
-        for proc in self.procs:
+        for proc in procs:
             while True:
                 if proc_x >= square_size:
                     proc_x = math.ceil(proc_size/2) -1
@@ -782,6 +793,10 @@ class _schem_builder:
                     self.placed_procs.append(block)
                     break
             proc_x += proc_size
+
+    def schem_add_procs(self):
+        self.schem_add_positioned_procs()
+        self.schem_add_unpositioned_procs()
         for proc in self.placed_procs:
             self.set_proc_links(proc.config, (proc.x, proc.y))
 
@@ -814,7 +829,7 @@ if __name__ == "__main__":
         code = f.read()
 
     transpiler = SFMlog()
-    out_schem = transpiler.transpile(code, args.src.parent)
+    out_schem = transpiler.transpile(code, args.src)
 
     print(out_schem)
 
