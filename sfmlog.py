@@ -1,4 +1,4 @@
-import sys, argparse, pathlib, re, pymsch, math, random
+import sys, argparse, pathlib, re, pymsch, math, random, time
 
 def _error(text: str, token):
     if token.file is None:
@@ -364,6 +364,9 @@ class _executer:
                         self.macro_run_counts[mac.name] += 1
                         mac_executer.execute()
                         self.output.extend(mac_executer.output)
+                        for index, arg in enumerate(mac.args):
+                            var_token = inst[index + 2]
+                            self.write_var(arg, mac_executer.resolve_var(var_token))
                     else:
                         _error(f"Unknown macro '{inst[1].value}'", inst[1])
                 case "pset":
@@ -829,9 +832,11 @@ if __name__ == "__main__":
         code = f.read()
 
     transpiler = SFMlog()
+    start_time = time.perf_counter()
     out_schem = transpiler.transpile(code, args.src)
+    end_time = time.perf_counter()
 
-    print(out_schem)
+    print(f"Created schematic '{out_schem.tags["name"]}' in {end_time - start_time:0.2f} seconds" )
 
     if args.copy:
         out_schem.write_clipboard()
