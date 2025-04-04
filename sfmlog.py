@@ -1,4 +1,4 @@
-import sys, argparse, pathlib, re, pymsch, math, random, time
+import sys, argparse, pathlib, re, pymsch, math, random, time, copy
 
 def _error(text: str, token):
     if token.file is None:
@@ -50,19 +50,21 @@ class _tokenizer:
         "pop": [True],
         "spop": [True],
         "if": [True],
-        "while": [True]
+        "while": [True],
+        "for": [True]
     }
 
     LINK_BLOCKS = ["gate", "foundation", "wall", "container", "afflict", "heater", "conveyor", "duct", "press", "tower", "pad", "projector", "swarmer", "factory", "drill", "router", "door", "illuminator", "processor", "sorter", "spectre", "parallax", "cell", "electrolyzer", "display", "chamber", "mixer", "conduit", "distributor", "crucible", "message", "unloader", "refabricator", "switch", "bore", "bank", "accelerator", "disperse", "vault", "point", "nucleus", "panel", "node", "condenser", "smelter", "pump", "generator", "tank", "reactor", "cultivator", "malign", "synthesizer", "deconstructor", "meltdown", "centrifuge", "radar", "driver", "void", "junction", "diffuse", "pulverizer", "salvo", "bridge", "acropolis", "dome", "reconstructor", "separator", "citadel", "concentrator", "mender", "lancer", "source", "loader", "duo", "melter", "crusher", "fabricator", "redirector", "disassembler", "gigantic", "incinerator", "scorch", "battery", "tsunami", "arc", "compressor", "assembler", "smite", "module", "bastion", "segment", "constructor", "ripple", "furnace", "wave", "foreshadow", "link", "mine", "scathe", "canvas", "diode", "extractor", "fuse", "kiln", "sublimate", "scatter", "cyclone", "titan", "turret", "lustre", "thruster", "shard", "weaver", "huge", "breach", "hail"]
 
     class token:
-        def __init__(self, type: str, value, line: int = 0, column: int = 0, file: pathlib.Path = None, scope = None):
+        def __init__(self, type: str, value, line: int = 0, column: int = 0, file: pathlib.Path = None, scope = None, exportable = True):
             self.type: str = type
             self.value = value
             self.line = line
             self.column = column
             self.file = file
             self.scope = scope
+            self.exportable = exportable
 
         def __repr__(self):
             if self.type in ["identifier", "label"]:
@@ -80,15 +82,15 @@ class _tokenizer:
 
         def with_scope(self, scope: str):
             if self.scope == None:
-                return _tokenizer.token(self.type, self.value, self.line, self.column, self.file, scope=scope)
+                return _tokenizer.token(self.type, self.value, self.line, self.column, self.file, scope=scope, exportable=self.exportable)
             else:
                 return self
 
         def at_pos(self, pos: tuple[int, int]):
-            return _tokenizer.token(self.type, self.value, pos[0], pos[1], self.file, scope=self.scope)
+            return _tokenizer.token(self.type, self.value, pos[0], pos[1], self.file, scope=self.scope, exportable=self.exportable)
 
         def at_token(self, token):
-            return _tokenizer.token(self.type, self.value, token.line, token.column, token.file , scope=self.scope)
+            return _tokenizer.token(self.type, self.value, token.line, token.column, token.file , scope=self.scope, exportable=self.exportable)
 
         def resolve_string(self):
             if self.type == "string":
@@ -135,7 +137,7 @@ class _tokenizer:
             return ("line_break", "\n")
 
         if(string[0] == '"' and string[-1] == '"'):
-            return ("string_literal", string)
+            return ("string", string)
 
         if(string[0] == '"' or string[-1] == '"'):
             print(f"ERROR at ({pos[0]},{pos[1]}): String not closed")
@@ -163,7 +165,7 @@ class _tokenizer:
             return ("number", float(string))
 
         if(string[0] == '@'):
-            return ("content_literal", string)
+            return ("content", string)
 
         if((string.rstrip("1234567890") in self.LINK_BLOCKS) and (string != string.rstrip("1234567890"))):
             return ("link_literal", string)
@@ -182,7 +184,7 @@ class _tokenizer:
             return ("global_identifier", string[1:])
 
         if(string  == "null"):
-            return ("defined_literal", string)
+            return ("null", string)
 
         return ("identifier", string)
 
@@ -200,10 +202,421 @@ class _tokenizer:
 class _executer:
     CONDITIONS = ["equal", "notEqual", "lessThan", "greaterThan", "lessThanEq", "greaterThanEq", "strictEqual"]
     DEFAULT_GLOBALS = {
-        "PROCESSOR_TYPE":  _tokenizer.token("content_literal", "@micro-processor"),
-        "SCHEMATIC_NAME":  _tokenizer.token("string_literal", '"SFMlog Schematic"'),
-        "SCHEMATIC_DESCRIPTION": _tokenizer.token("string_literal", '"This schematic was generated using SFMlog."')
+        "PROCESSOR_TYPE":  _tokenizer.token("content", "@micro-processor"),
+        "SCHEMATIC_NAME":  _tokenizer.token("string", '"SFMlog Schematic"'),
+        "SCHEMATIC_DESCRIPTION": _tokenizer.token("string", '"This schematic was generated using SFMlog."')
     }
+
+    class Instruction:
+        def __init__(self, keyword, exec_func):
+            self.keyword: str = keyword
+            self.exec_func: Callable = exec_func
+
+    class Instructions:
+        def init_instructions(executer):
+            inst = _executer.Instructions
+            executer.init_instruction("import", inst.I_import)
+            executer.init_instruction("readfile", inst.I_readfile)
+            executer.init_instruction("block", inst.I_block)
+            executer.init_instruction("proc", inst.I_proc)
+            executer.init_instruction("defmac", inst.I_defmac)
+            executer.init_instruction("mac", inst.I_mac)
+            executer.init_instruction("getmac", inst.I_getmac)
+            executer.init_instruction("setmac", inst.I_setmac)
+            executer.init_instruction("type", inst.I_type)
+            executer.init_instruction("pset", inst.I_pset)
+            executer.init_instruction("pop", inst.I_pop)
+            executer.init_instruction("strop", inst.I_strop)
+            executer.init_instruction("strlabel", inst.I_strlabel)
+            executer.init_instruction("strvar", inst.I_strvar)
+            executer.init_instruction("list", inst.I_list)
+            executer.init_instruction("table", inst.I_table)
+            executer.init_instruction("if", inst.I_if)
+            executer.init_instruction("while", inst.I_while)
+            executer.init_instruction("for", inst.I_for)
+            executer.init_instruction("log", inst.I_log)
+
+        def I_import(inst, executer): # Imports and executes a separate sfmlog file
+            import_file = executer.resolve_var(inst[1])
+            if import_file.type == "string":
+                import_file = pathlib.Path(import_file.value[1:-1])
+            else:
+                import_file = pathlib.Path(str(import_file.value))
+            if not import_file.is_absolute():
+                import_file = executer.cwd / import_file
+            try:
+                with open(import_file, "r") as file:
+                    import_code = file.read()
+            except FileNotFoundError:
+                _error(f"File '{import_file}' not found", inst[1])
+            import_tokenizer = _tokenizer(import_code, import_file)
+            import_executer = _executer(import_tokenizer.tokens , import_file.parent, executer.global_vars, executer.scope_str, executer.schem_builder)
+            import_executer.macros = executer.macros
+            import_executer.vars = executer.vars
+            import_executer.allow_mlog = executer.allow_mlog
+            import_executer.macro_run_counts = executer.macro_run_counts
+            import_executer.execute()
+            executer.output.extend(import_executer.output)
+
+        def I_readfile(inst, executer): # Reads a file's contents to a string variable ## TODO
+            pass
+
+        def I_block(inst, executer): # Adds a block to the schematic
+            var_name = inst[1]
+            if var_name.type not in ["identifier", "global_identifier"]:
+                _error("Invalid variable name", var_name)
+            block_type = inst[2]
+            if block_type.type != "content":
+                _error("Expected block type", block_type)
+            block_pos = None
+            block_rot = 0
+            if 4 in inst:
+                if executer.resolve_var(inst[3]).type != "number":
+                    _error("Expected numeric value", inst[3])
+                if executer.resolve_var(inst[4]).type != "number":
+                    _error("Expected numeric value", inst[4])
+                block_pos = (int(executer.resolve_var(inst[3]).value), int(executer.resolve_var(inst[4]).value))
+            if 5 in inst:
+                if type(executer.resolve_var(inst[5]).value) != float:
+                    _error("Expected numeric value", inst[5])
+                block_rot = int(executer.resolve_var(inst[5]).value)
+
+            block = executer.schem_builder.Block(inst, block_type, block_pos, block_rot)
+            link_name = executer.schem_builder.add_block(block)
+            executer.write_var(var_name, _tokenizer.token("block_var", link_name))
+
+        def I_proc(inst, executer): # Adds a processor to the schematic
+            proc_code = executer.read_till("endproc", ["proc"])
+            if proc_code is None:
+                _error("'endproc' expected, but not found", inst[0])
+            proc_executer = _executer(proc_code, executer.cwd, executer.global_vars, "_", executer.schem_builder)
+            proc_executer.macros = executer.macros
+            proc_executer.execute()
+            if 4 in inst:
+                proc_type = executer.resolve_var(inst[2])
+            elif 2 in inst:
+                _error("Unable to define type of proc without defined position", inst[2])
+            else:
+                proc_type = None
+            if 4 in inst:
+                if executer.resolve_var(inst[3]).type != "number":
+                    _error("Expected numeric value", inst[3])
+                if executer.resolve_var(inst[4]).type != "number":
+                    _error("Expected numeric value", inst[4])
+                pos = (int(executer.resolve_var(inst[3]).value), int(executer.resolve_var(inst[4]).value))
+            else:
+                pos = None
+            proc_name = executer.schem_builder.add_proc(executer.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos, proc_type, inst))
+            if 1 in inst:
+                executer.write_var(inst[1], _tokenizer.token("block_var", proc_name))
+
+        def I_defmac(inst, executer): # Defines a macro
+            mac_code = executer.read_till("endmac", ["defmac"])
+            if mac_code is None:
+                _error("'endmac' expected, but not found", inst[0])
+            if inst[1].type != "identifier":
+                _error("Invalid name for macro", inst[1])
+            mac_args = []
+            for arg in inst.tokens[2:-1]:
+                if arg.type != "identifier":
+                    _error("Invalid name for macro argument", arg)
+                mac_args.append(arg)
+            executer.macros[inst[1].value] = executer.Macro(inst[1].value, mac_code, mac_args)
+
+        def I_mac(inst, executer): # Calls a macro
+            if inst[1].value in executer.macros:
+                mac = executer.macros[inst[1].value]
+                if mac.name not in executer.macro_run_counts:
+                    executer.macro_run_counts[mac.name] = 0
+                mac_executer = _executer(mac.code, executer.cwd, executer.global_vars, f"{executer.scope_str}{mac.name}_{executer.macro_run_counts[mac.name]}_", executer.schem_builder)
+                for index, arg in enumerate(mac.args):
+                    var_token = inst[index + 2]
+                    mac_executer.write_var(arg, executer.resolve_var(var_token))
+                mac_executer.macros = executer.macros.copy()
+
+                executer.macro_run_counts[mac.name] += 1
+                mac_executer.execute()
+                executer.output.extend(mac_executer.output)
+                for index, arg in enumerate(mac.args):
+                    var_token = inst[index + 2]
+                    executer.write_var(var_token, mac_executer.resolve_var(arg))
+            else:
+                _error(f"Unknown macro '{inst[1].value}'", inst[1])
+            
+        def I_getmac(inst, executer): # Writes a macro to a variable
+            if inst[2].value not in executer.macros:
+                _error(f"Unknown macro '{inst[2].value}'", inst[2])
+            executer.write_var(inst[1], executer.convert_to_var(executer.macros[inst[2].value]))
+
+        def I_setmac(inst, executer): # Sets a macro from a variable
+            mac = executer.resolve_var(inst[2])
+            if mac.type != "macro":
+                _error(f"Variable '{inst[2].value}' isn't of type 'macro'", inst[2])
+            if inst[1].type != "identifier":
+                _error("Invalid name for macro", inst[1])
+            executer.macros[inst[1].value] = mac.value
+
+        def I_type(inst, executer): # Gets the type of a value
+            executer.write_var(inst[1], executer.convert_to_var(executer.resolve_var(inst[2]).type))
+
+        def I_pset(inst, executer): # Sets a variable
+            value = executer.resolve_var(inst[2])
+            if value.type in ["identifier", "global_identifier"]:
+                _error(f"Unable to write type '{value.type}' to a variable", inst[2])
+            executer.write_var(inst[1], value)
+
+        def I_pop(inst, executer): # Performs math operations
+            executer.write_var(inst[2], executer.eval_math(inst[1], executer.resolve_var(inst[3]), executer.resolve_var(inst[4])))
+
+        def I_strop(inst, executer): # Performs string operations ## TODO
+            pass
+
+        def I_strlabel(inst, executer): # Creates a label from a string ## TODO
+            pass
+
+        def I_strvar(inst, executer): # Writes a variable name to a variable from a string ## TODO
+            pass
+
+        def I_list(inst, executer): # Performs list operations
+            match inst[1].value:
+                case "from": # Creates a list from instruction arguments
+                    output_list = inst[2]
+                    lst = []
+                    for elem in inst.tokens[3:-1]:
+                        value = executer.resolve_var(elem)
+                        if value.type in ["identifier", "global_identifier"]:
+                            _error(f"Unable to write type '{value.type}' to list", elem)
+                        lst.append(value)
+                    executer.write_var(output_list, executer.convert_to_var(lst))
+                case "set": # Sets an index value
+                    output_list = inst[2]
+                    input_list = inst[3]
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    value = executer.resolve_var(inst[4])
+                    if value.type in ["identifier", "global_identifier"]:
+                        _error(f"Unable to write type '{value.type}' to list", inst[4])
+                    index = executer.resolve_var(inst[5])
+                    if index.type != "number":
+                        _error(f"Expected type 'number', got type '{index.type}'", inst[5])
+                    try:
+                        lst[int(index.value)] = value
+                    except IndexError:
+                        _error("Index out of range", inst[5])
+                    executer.write_var(output_list, executer.convert_to_var(lst))
+                case "get": # Gets an index value
+                    output = inst[2]
+                    input_list = inst[3]
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    index = executer.resolve_var(inst[4])
+                    if index.type != "number":
+                        _error(f"Expected type 'number', got type '{index.type}'", inst[4])
+                    try:
+                        executer.write_var(output, lst[int(index.value)])
+                    except IndexError:
+                        _error("Index out of range", inst[4])
+                case "append": # Appends value to the end
+                    output_list = inst[2]
+                    input_list = inst[3]
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    value = executer.resolve_var(inst[4])
+                    lst.append(value)
+                    executer.write_var(output_list, executer.convert_to_var(lst))
+                case "insert": # Inserts value at an index
+                    output_list = inst[2]
+                    input_list = inst[3]
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    value = executer.resolve_var(inst[4])
+                    index = executer.resolve_var(inst[5])
+                    if index.type != "number":
+                        _error(f"Expected type 'number', got type '{index.type}'", inst[5])
+                    lst.insert(int(index.value), value)
+                    executer.write_var(output_list, executer.convert_to_var(lst))
+                case "del": # Removes value from an index
+                    output_list = inst[2]
+                    input_list = inst[3]
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    index = executer.resolve_var(inst[4])
+                    if index.type != "number":
+                        _error(f"Expected type 'number', got type '{index.type}'", inst[4])
+                    try:
+                        lst.pop(int(index.value))
+                    except IndexError:
+                        _error("Index out of range", inst[4])
+                    executer.write_var(output_list, executer.convert_to_var(lst))
+                case "len": # Gets length
+                    output = inst[2]
+                    input_list = inst[3]
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    if executer.resolve_var(input_list).type == "list":
+                        executer.write_var(output, executer.convert_to_var(len(executer.resolve_var(input_list).value)))
+                    else:
+                        executer.write_var(output, executer.convert_to_var(None))
+                case _:
+                    _error(f"Unknown list operation \"{inst[1].value}\"", inst[1])
+        
+        def I_table(inst, executer): # Performs table operations ## TODO
+            match inst[1].value:
+                case "from": # Creates a table from sequential key value pairs
+                    output_table = inst[2]
+                    tbl = {}
+                    if len(inst.tokens[3:-1]) % 2 != 0:
+                        _error("Unfinished key value pair", inst.tokens[-1])
+                    for i in range(len(inst.tokens[3:-1])//2):
+                        elem1 = inst.tokens[(i*2)+3]
+                        elem2 = inst.tokens[(i*2)+4]
+                        key = executer.resolve_var(elem1)
+                        value = executer.resolve_var(elem2)
+                        if key.type in ["identifier", "global_identifier"]:
+                            _error(f"Unable to write type '{value.type}' to table key", elem1)
+                        if value.type in ["identifier", "global_identifier"]:
+                            _error(f"Unable to write type '{value.type}' to table value", elem2)
+                        tbl[key.value] = value
+                    executer.write_var(output_table, executer.convert_to_var(tbl))
+                case "set": # Sets a key's value in a table
+                    output_table = inst[2]
+                    input_table = inst[3]
+                    if input_table.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_table)
+                        tbl = copy.deepcopy(var.value) if var.type == "table" else {}
+                    else:
+                        tbl = {}
+                    key = executer.resolve_var(inst[4])
+                    value = executer.resolve_var(inst[5])
+                    if key.type in ["identifier", "global_identifier"]:
+                        _error(f"Unable to write type '{key.type}' to table key", inst[4])
+                    if value.type in ["identifier", "global_identifier"]:
+                        _error(f"Unable to write type '{value.type}' to table value", inst[5])
+                    tbl[key.value] = value
+                    executer.write_var(output_table, executer.convert_to_var(tbl))
+                case "get": # Gets a key's value in a table
+                    output = inst[2]
+                    input_table = inst[3]
+                    if input_table.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_table)
+                        tbl = copy.deepcopy(var.value) if var.type == "table" else {}
+                    else:
+                        tbl = {}
+                    key = executer.resolve_var(inst[4])
+                    try:
+                        executer.write_var(output, tbl[key.value])
+                    except KeyError:
+                        _error(f"Key '{key.value}' not found", inst[4])
+                case "del": # Removes a key
+                    output_table = inst[2]
+                    input_table = inst[3]
+                    if input_table.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_table)
+                        tbl = copy.deepcopy(var.value) if var.type == "table" else {}
+                    else:
+                        tbl = {}
+                    key = executer.resolve_var(inst[4])
+                    try:
+                        tbl.pop(key.value)
+                    except KeyError:
+                        _error(f"Key '{key.value}' not found", inst[4])
+                    executer.write_var(output_table, executer.convert_to_var(tbl))
+                case "readjson": # Creates a table from a json string
+                    pass
+                case "writejson": # Creates a json string from a table
+                    pass
+                case _:
+                    _error(f"Unknown table operation \"{inst[1].value}\"", inst[1]) 
+        
+        def I_if(inst, executer): # Runs code depending on a condition
+            code_sections = executer.read_sections("endif", ["if"], ["elif", "else"])
+            if code_sections is None:
+                _error("'endif' expected, but not found", inst[0])
+
+            for instruction, code_block in code_sections:
+                if instruction[0].value == "else" or executer.eval_condition(instruction[1], executer.resolve_var(instruction[2]), executer.resolve_var(instruction.option(3))).value:
+                    block_executer = _executer(code_block, executer.cwd, executer.global_vars, executer.scope_str, executer.schem_builder)
+                    block_executer.macros = executer.macros
+                    block_executer.vars = executer.vars
+                    block_executer.allow_mlog = executer.allow_mlog
+                    block_executer.macro_run_counts = executer.macro_run_counts
+                    block_executer.execute()
+                    executer.output.extend(block_executer.output)
+                    break
+        
+        def I_while(inst, executer): # Loops code depending on a condition
+            code_block = executer.read_till("endwhile", ["while"])
+            if code_block is None:
+                _error("'endwhile' expected, but not found", inst[0])
+            while executer.eval_condition(inst[1], executer.resolve_var(inst[2]), executer.resolve_var(inst.option(3))).value:
+                block_executer = _executer(code_block, executer.cwd, executer.global_vars, executer.scope_str, executer.schem_builder)
+                block_executer.macros = executer.macros
+                block_executer.vars = executer.vars
+                block_executer.allow_mlog = executer.allow_mlog
+                block_executer.macro_run_counts = executer.macro_run_counts
+                block_executer.execute()
+                executer.output.extend(block_executer.output)
+        
+        def I_for(inst, executer): # Loops code via iterator operations
+            code_block = executer.read_till("endfor", ["for"])
+            if code_block is None:
+                _error("'endfor' expected, but not found", inst[0])
+            for_iter = None
+            match inst[1].value:
+                case "range":
+                    if 5 in inst:
+                        if int(executer.coerce_num(executer.resolve_var(inst[5]))) == 0:
+                            _error("'for range' step value must not be zero", inst[5])
+                        for_iter = range(int(executer.coerce_num(executer.resolve_var(inst[3]))), int(executer.coerce_num(executer.resolve_var(inst[4]))), int(executer.coerce_num(executer.resolve_var(inst[5]))))
+                    elif 4 in inst:
+                        for_iter = range(int(executer.coerce_num(executer.resolve_var(inst[3]))), int(executer.coerce_num(executer.resolve_var(inst[4]))))
+                    else:
+                        for_iter = range(int(executer.coerce_num(executer.resolve_var(inst[3]))))
+                case "list":
+                    lst = executer.resolve_var(inst[3])
+                    if lst.type != "list":
+                        _error(f"Expected type 'list', got '{lst.type}'", inst[3])
+                    for_iter = iter(lst.value)
+                case "table":
+                    tbl = executer.resolve_var(inst[4])
+                    if tbl.type != "table":
+                        _error(f"Expected type 'table', got '{tbl.type}'", inst[4])
+                    for_iter = tbl.value.items()
+
+            for i in for_iter:
+                if type(i) == tuple:
+                    for index, value in enumerate(i):
+                        executer.write_var(inst[2+index], executer.convert_to_var(value))
+                else:
+                    executer.write_var(inst[2], executer.convert_to_var(i))
+                block_executer = _executer(code_block, executer.cwd, executer.global_vars, executer.scope_str, executer.schem_builder)
+                block_executer.macros = executer.macros
+                block_executer.vars = executer.vars
+                block_executer.allow_mlog = executer.allow_mlog
+                block_executer.macro_run_counts = executer.macro_run_counts
+                block_executer.execute()
+                executer.output.extend(block_executer.output)
+        
+        def I_log(inst, executer): # Writes out to the console
+            print("".join(map(executer.resolve_log ,inst.tokens[1:-1])))
 
     class InstructionLine:
         def __init__(self, tokens):
@@ -213,14 +626,14 @@ class _executer:
             try:
                 out = self.tokens[index]
             except IndexError:
-                _error(f"Instruction {self.tokens[0].value} expected argument at position {index}", self.tokens[-1])
+                _error(f"Instruction '{self.tokens[0].value}' expected argument at position {index}", self.tokens[-1])
             if out.type == "line_break":
-                _error(f"Instruction {self.tokens[0].value} expected argument at position {index}", out)
+                _error(f"Instruction '{self.tokens[0].value}' expected argument at position {index}", out)
             return out
 
         def option(self, index, default = None):
             if default is None:
-                default = _tokenizer.token("defined_literal", "null").at_token(self.tokens[-1])
+                default = _tokenizer.token("null", "null").at_token(self.tokens[-1])
             try:
                 return self.tokens[index]
             except IndexError:
@@ -247,9 +660,14 @@ class _executer:
             self.code: list[_tokenizer.token] = code
             self.args: list[_tokenizer.token] = args
 
+        def __str__(self):
+            return f"macro({self.name})"
+
     def __init__(self, code: list[_tokenizer.token], cwd: pathlib.Path, global_vars: dict[str, _tokenizer.token], scope_str: str, schem_builder):
+        self.instructions: list[Instruction] = []
+        self.Instructions.init_instructions(self)
         self.code: list[_tokenizer.token] = code
-        self.instructions = self.read_lines()
+        self.lines = self.read_lines()
         self.output: list[_tokenizer.token] = []
         self.cwd: pathlib.Path = cwd
         self.scope_str = scope_str
@@ -265,174 +683,17 @@ class _executer:
 
     def execute(self):
         while True:
-            if self.exec_pointer >= len(self.instructions):
+            if self.exec_pointer >= len(self.lines):
                 break
-            inst = self.instructions[self.exec_pointer]
+            inst = self.lines[self.exec_pointer]
+            
+            self.exec_instruction(inst)
 
-            match inst[0].value:
-                case "import":
-                    import_file = self.resolve_var(inst[1])
-                    if import_file.type == "string_literal":
-                        import_file = pathlib.Path(import_file.value[1:-1])
-                    else:
-                        import_file = pathlib.Path(str(import_file.value))
-                    if not import_file.is_absolute():
-                        import_file = self.cwd / import_file
-                    try:
-                        with open(import_file, "r") as file:
-                            import_code = file.read()
-                    except FileNotFoundError:
-                        _error(f"File '{import_file}' not found", inst[1])
-                    import_tokenizer = _tokenizer(import_code, import_file)
-                    import_executer = _executer(import_tokenizer.tokens , import_file.parent, self.global_vars, self.scope_str, self.schem_builder)
-                    import_executer.macros = self.macros
-                    import_executer.vars = self.vars
-                    import_executer.allow_mlog = self.allow_mlog
-                    import_executer.macro_run_counts = self.macro_run_counts
-                    import_executer.execute()
-                    self.output.extend(import_executer.output)
-                case "block":
-                    var_name = inst[1]
-                    if var_name.type not in ["identifier", "global_identifier"]:
-                        _error("Invalid variable name", var_name)
-                    block_type = inst[2]
-                    if block_type.type != "content_literal":
-                        _error("Expected block type", block_type)
-                    block_pos = None
-                    block_rot = 0
-                    if 4 in inst:
-                        if self.resolve_var(inst[3]).type != "number":
-                            _error("Expected numeric value", inst[3])
-                        if self.resolve_var(inst[4]).type != "number":
-                            _error("Expected numeric value", inst[4])
-                        block_pos = (int(self.resolve_var(inst[3]).value), int(self.resolve_var(inst[4]).value))
-                    if 5 in inst:
-                        if type(self.resolve_var(inst[5]).value) != float:
-                            _error("Expected numeric value", inst[5])
-                        block_rot = int(self.resolve_var(inst[5]).value)
-
-                    block = self.schem_builder.Block(inst, block_type, block_pos, block_rot)
-                    link_name = self.schem_builder.add_block(block)
-                    self.write_var(var_name, _tokenizer.token("block_var", link_name))
-                case "proc":
-                    proc_code = self.read_till("endproc", ["proc"])
-                    if proc_code is None:
-                        _error("'endproc' expected, but not found", inst[0])
-                    proc_executer = _executer(proc_code, self.cwd, self.global_vars, "_", self.schem_builder)
-                    proc_executer.macros = self.macros
-                    proc_executer.execute()
-                    if 4 in inst:
-                        proc_type = self.resolve_var(inst[2])
-                    elif 2 in inst:
-                        _error("Unable to define type of proc without defined position", inst[2])
-                    else:
-                        proc_type = None
-                    if 4 in inst:
-                        if self.resolve_var(inst[3]).type != "number":
-                            _error("Expected numeric value", inst[3])
-                        if self.resolve_var(inst[4]).type != "number":
-                            _error("Expected numeric value", inst[4])
-                        pos = (int(self.resolve_var(inst[3]).value), int(self.resolve_var(inst[4]).value))
-                    else:
-                        pos = None
-                    proc_name = self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos, proc_type, inst))
-                    if 1 in inst:
-                        self.write_var(inst[1], _tokenizer.token("block_var", proc_name))
-                case "defmac":
-                    mac_code = self.read_till("endmac", ["defmac"])
-                    if mac_code is None:
-                        _error("'endmac' expected, but not found", inst[0])
-                    if inst[1].type != "identifier":
-                        _error("Invalid name for macro", inst[1])
-                    mac_args = []
-                    for arg in inst.tokens[2:-1]:
-                        if arg.type != "identifier":
-                            _error("Invalid name for macro argument", arg)
-                        mac_args.append(arg)
-                    self.macros[inst[1].value] = self.Macro(inst[1].value, mac_code, mac_args)
-                case "mac":
-                    if inst[1].value in self.macros:
-                        mac = self.macros[inst[1].value]
-                        if mac.name not in self.macro_run_counts:
-                            self.macro_run_counts[mac.name] = 0
-                        mac_executer = _executer(mac.code, self.cwd, self.global_vars, f"{self.scope_str}{mac.name}_{self.macro_run_counts[mac.name]}_", self.schem_builder)
-                        for index, arg in enumerate(mac.args):
-                            var_token = inst[index + 2]
-                            mac_executer.write_var(arg, self.resolve_var(var_token))
-                        mac_executer.macros = self.macros.copy()
-
-                        self.macro_run_counts[mac.name] += 1
-                        mac_executer.execute()
-                        self.output.extend(mac_executer.output)
-                        for index, arg in enumerate(mac.args):
-                            var_token = inst[index + 2]
-                            self.write_var(arg, mac_executer.resolve_var(var_token))
-                    else:
-                        _error(f"Unknown macro '{inst[1].value}'", inst[1])
-                case "pset":
-                    self.write_var(inst[1], self.resolve_var(inst[2]))
-                case "pop":
-                    self.write_var(inst[2], self.eval_math(inst[1], self.resolve_var(inst[3]), self.resolve_var(inst[4])))
-                case "if":
-                    code_sections = self.read_sections("endif", ["if"], ["elif", "else"])
-                    if code_sections is None:
-                        _error("'endif' expected, but not found", inst[0])
-
-                    for instruction, code_block in code_sections:
-                        if instruction[0].value == "else" or self.eval_condition(instruction[1], self.resolve_var(instruction[2]), self.resolve_var(instruction.option(3))).value:
-                            block_executer = _executer(code_block, self.cwd, self.global_vars, self.scope_str, self.schem_builder)
-                            block_executer.macros = self.macros
-                            block_executer.vars = self.vars
-                            block_executer.allow_mlog = self.allow_mlog
-                            block_executer.macro_run_counts = self.macro_run_counts
-                            block_executer.execute()
-                            self.output.extend(block_executer.output)
-                            break
-                case "while":
-                    code_block = self.read_till("endwhile", ["while"])
-                    if code_block is None:
-                        _error("'endwhile' expected, but not found", inst[0])
-                    while self.eval_condition(inst[1], self.resolve_var(inst[2]), self.resolve_var(inst.option(3))).value:
-                        block_executer = _executer(code_block, self.cwd, self.global_vars, self.scope_str, self.schem_builder)
-                        block_executer.macros = self.macros
-                        block_executer.vars = self.vars
-                        block_executer.allow_mlog = self.allow_mlog
-                        block_executer.macro_run_counts = self.macro_run_counts
-                        block_executer.execute()
-                        self.output.extend(block_executer.output)
-                case "for":
-                    code_block = self.read_till("endfor", ["for"])
-                    if code_block is None:
-                        _error("'endfor' expected, but not found", inst[0])
-                    if inst[1].value == "range":
-                        if 5 in inst:
-                            if int(self.coerce_num(self.resolve_var(inst[5]))) == 0:
-                                _error("'for range' step value must not be zero", inst[5])
-                            iter_range = range(int(self.coerce_num(self.resolve_var(inst[3]))), int(self.coerce_num(self.resolve_var(inst[4]))), int(self.coerce_num(self.resolve_var(inst[5]))))
-                        elif 4 in inst:
-                            iter_range = range(int(self.coerce_num(self.resolve_var(inst[3]))), int(self.coerce_num(self.resolve_var(inst[4]))))
-                        else:
-                            iter_range = range(int(self.coerce_num(self.resolve_var(inst[3]))))
-
-                        for i in iter_range:
-                            self.write_var(inst[2], _tokenizer.token("number", i))
-                            block_executer = _executer(code_block, self.cwd, self.global_vars, self.scope_str, self.schem_builder)
-                            block_executer.macros = self.macros
-                            block_executer.vars = self.vars
-                            block_executer.allow_mlog = self.allow_mlog
-                            block_executer.macro_run_counts = self.macro_run_counts
-                            block_executer.execute()
-                            self.output.extend(block_executer.output)
-                case "log":
-                    print("".join(map(self.resolve_log ,inst.tokens[1:-1])))
-                case _:
-                    for token in inst.tokens:
-                        self.output.append(self.resolve_var(token))
             if len(self.output) > 0 and not self.allow_mlog:
                 _error("Mlog instructions not allowed outside a 'proc' statement", inst[0])
             self.exec_pointer += 1
         if self.allow_mlog and self.is_root and len(self.output) > 0:
-            self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(self.output), None))
+            self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(self.output), None, self.global_vars["global_PROCESSOR_TYPE"], None))
         if self.is_root:
             self.schem_builder.processor_type = self.global_vars["global_PROCESSOR_TYPE"]
             self.schem_builder.set_name(self.resolve_log(self.global_vars["global_SCHEMATIC_NAME"]))
@@ -458,9 +719,9 @@ class _executer:
         level = 0
         while True:
             self.exec_pointer += 1
-            if self.exec_pointer >= len(self.instructions):
+            if self.exec_pointer >= len(self.lines):
                 return None
-            inst = self.instructions[self.exec_pointer]
+            inst = self.lines[self.exec_pointer]
             if inst[0].value in start_word:
                 level += 1
             elif inst[0].value == end_word and level > 0:
@@ -472,13 +733,13 @@ class _executer:
     def read_sections(self, end_word: str, start_word: list[str], split_word: list[str]) -> list[list[_tokenizer.token]] | None:
         sections = []
         section = []
-        prev_line = self.instructions[self.exec_pointer]
+        prev_line = self.lines[self.exec_pointer]
         level = 0
         while True:
             self.exec_pointer += 1
-            if self.exec_pointer >= len(self.instructions):
+            if self.exec_pointer >= len(self.lines):
                 return None
-            inst = self.instructions[self.exec_pointer]
+            inst = self.lines[self.exec_pointer]
             if inst[0].value in start_word:
                 level += 1
             elif inst[0].value == end_word and level > 0:
@@ -511,6 +772,35 @@ class _executer:
         for name, value in self.DEFAULT_GLOBALS.items():
             self.global_vars[f"global_{name}"] = value
 
+    def convert_to_var(self, value):
+        match value:
+            case (int() | float() | bool()):
+                return _tokenizer.token("number", float(value))
+            case str() as v if v[0] == '"' and v[-1] == '"':
+                return _tokenizer.token("string", value)
+            case str() as v if v[0] == '@':
+                return _tokenizer.token("content", value)
+            case str():
+                return _tokenizer.token("string", '"' + value + '"')
+            case list():
+                lst = []
+                for item in value:
+                    lst.append(self.convert_to_var(item))
+                return _tokenizer.token("list", lst, exportable = False)
+            case dict():
+                tbl = {}
+                for key, value in value.items():
+                    tbl[self.convert_to_var(key).value] = self.convert_to_var(value)
+                return _tokenizer.token("table", tbl, exportable = False)
+            case self.Macro():
+                return _tokenizer.token("macro", value, exportable = False)
+            case None:
+                return _tokenizer.token("null", "null")
+            case _tokenizer.token():
+                return value
+            case _:
+                raise Exception(f"Unhandled type {type(value)}")
+
     def resolve_var(self, name: _tokenizer.token):
         if name.type == "identifier" and str(name) in self.vars:
             return self.vars[str(name)].with_scope(self.scope_str).at_token(name)
@@ -520,8 +810,20 @@ class _executer:
             return name.with_scope(self.scope_str)
 
     def resolve_log(self, token: _tokenizer.token) -> str:
-        if token.type == "string_literal":
-            return token.value[1:-1].replace("\\n", "\n")
+        if self.resolve_var(token).type == "string":
+            return self.resolve_var(token).value[1:-1].replace("\\n", "\n")
+        elif self.resolve_var(token).type == "list":
+            return f'[{", ".join([self.resolve_output(x) for x in self.resolve_var(token).value])}]'
+        elif self.resolve_var(token).type == "table":
+            return f'{{{", ".join([f"{str(k)}: {self.resolve_output(v)}" for k, v in self.resolve_var(token).value.items()])}}}'
+        else:
+            return str(self.resolve_var(token))
+
+    def resolve_output(self, token: _tokenizer.token) -> str:
+        if self.resolve_var(token).type == "list":
+            return f'[{", ".join([self.resolve_output(x) for x in self.resolve_var(token).value])}]'
+        elif self.resolve_var(token).type == "table":
+            return f'{{{", ".join([f"{str(k)}: {self.resolve_output(v)}" for k, v in self.resolve_var(token).value.items()])}}}'
         else:
             return str(self.resolve_var(token))
 
@@ -537,9 +839,9 @@ class _executer:
     def coerce_num(self, token: _tokenizer.token) -> float:
         if token.type == "number":
             return token.value
-        elif token.type == "defined_literal" and token.value == "null":
+        elif token.type == "null" and token.value == "null":
             return 0
-        elif token.type == "string_literal" and token.value == '""':
+        elif token.type == "string" and token.value == '""':
             return 0
         elif token.type in ["identifier", "global_identifier"]:
             return 0
@@ -673,6 +975,22 @@ class _executer:
                 _error(f"Unknown condition \"{operation.value}\"", operation)
 
         return _tokenizer.token("number", float(out))
+
+    def init_instruction(self, keyword, exec_func):
+        instruction = self.Instruction(keyword, exec_func)
+        self.instructions.append(instruction)
+
+    def exec_instruction(self, inst):
+        for i in self.instructions:
+            if inst[0].value == i.keyword:
+                i.exec_func(inst, self)
+                break
+        else:
+            for token in inst.tokens:
+                if self.resolve_var(token).exportable:
+                    self.output.append(self.resolve_var(token))
+                else:
+                    _error(f"Unable to output type '{self.resolve_var(token).type}' to mlog", token)
 
 class _schem_builder:
     class Proc:
