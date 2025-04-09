@@ -1,4 +1,4 @@
-import sys, argparse, pathlib, re, pymsch, math, random, time, copy
+import sys, argparse, pathlib, re, pymsch, math, random, time, copy, json
 
 def _error(text: str, token):
     if token.file is None:
@@ -216,7 +216,6 @@ class _executer:
         def init_instructions(executer):
             inst = _executer.Instructions
             executer.init_instruction("import", inst.I_import)
-            executer.init_instruction("readfile", inst.I_readfile)
             executer.init_instruction("block", inst.I_block)
             executer.init_instruction("proc", inst.I_proc)
             executer.init_instruction("defmac", inst.I_defmac)
@@ -258,9 +257,6 @@ class _executer:
             import_executer.execute()
             executer.output.extend(import_executer.output)
 
-        def I_readfile(inst, executer): # Reads a file's contents to a string variable ## TODO
-            pass
-
         def I_block(inst, executer): # Adds a block to the schematic
             var_name = inst[1]
             if var_name.type not in ["identifier", "global_identifier"]:
@@ -283,7 +279,7 @@ class _executer:
 
             block = executer.schem_builder.Block(inst, block_type, block_pos, block_rot)
             link_name = executer.schem_builder.add_block(block)
-            executer.write_var(var_name, _tokenizer.token("block_var", link_name))
+            executer.write_var(var_name, _tokenizer.token("block", link_name))
 
         def I_proc(inst, executer): # Adds a processor to the schematic
             proc_code = executer.read_till("endproc", ["proc"])
@@ -308,7 +304,7 @@ class _executer:
                 pos = None
             proc_name = executer.schem_builder.add_proc(executer.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos, proc_type, inst))
             if 1 in inst:
-                executer.write_var(inst[1], _tokenizer.token("block_var", proc_name))
+                executer.write_var(inst[1], _tokenizer.token("block", proc_name))
 
         def I_defmac(inst, executer): # Defines a macro
             mac_code = executer.read_till("endmac", ["defmac"])
@@ -369,13 +365,39 @@ class _executer:
             executer.write_var(inst[2], executer.eval_math(inst[1], executer.resolve_var(inst[3]), executer.resolve_var(inst[4])))
 
         def I_strop(inst, executer): # Performs string operations ## TODO
-            pass
+            str_op = inst[1]
+            str_out = inst[2]
+            str_in = str(executer.convert_var_to_py(executer.resolve_var(inst[3])))
+            str_in2 = str(executer.convert_var_to_py(executer.resolve_var(inst[4])))
+            out_val = ""
+            match str_op.value:
+                case "cat":
+                    out_val = str_in + str_in2
+            executer.write_var(str_out, executer.convert_to_var(out_val))
 
-        def I_strlabel(inst, executer): # Creates a label from a string ## TODO
-            pass
+        def I_strlabel(inst, executer): # Creates a label from a string
+            value = executer.resolve_var(inst[1])
+            if value.type != "string":
+                _error(f"Expected type 'string', got type '{value.type}'", inst[1])
+            executer.output.append(_tokenizer.token("label", value.value[1:-1].replace(" ", "_") + ':').with_scope(executer.scope_str).at_token(inst[1]))
+            executer.output.append(inst.tokens[-1])
 
         def I_strvar(inst, executer): # Writes a variable name to a variable from a string ## TODO
-            pass
+            var_out = inst[2]
+            str_in = executer.resolve_var(inst[3])
+            if str_in.type != "string":
+                _error(f"Expected type 'string', got type '{str_in.type}'", inst[3])
+
+            token_type = None
+            match inst[1].value:
+                case "local":
+                    token_type = "identifier"
+                case "global":
+                    token_type = "global_identifier"
+                case _:
+                    _error(f"Unknown variable context '{inst[1].value}'")
+
+            executer.write_var(var_out, _tokenizer.token(token_type, str_in.value[1:-1].replace(" ", "_")))
 
         def I_list(inst, executer): # Performs list operations
             match inst[1].value:
@@ -384,8 +406,6 @@ class _executer:
                     lst = []
                     for elem in inst.tokens[3:-1]:
                         value = executer.resolve_var(elem)
-                        if value.type in ["identifier", "global_identifier"]:
-                            _error(f"Unable to write type '{value.type}' to list", elem)
                         lst.append(value)
                     executer.write_var(output_list, executer.convert_to_var(lst))
                 case "set": # Sets an index value
@@ -397,8 +417,6 @@ class _executer:
                     else:
                         lst = []
                     value = executer.resolve_var(inst[4])
-                    if value.type in ["identifier", "global_identifier"]:
-                        _error(f"Unable to write type '{value.type}' to list", inst[4])
                     index = executer.resolve_var(inst[5])
                     if index.type != "number":
                         _error(f"Expected type 'number', got type '{index.type}'", inst[5])
@@ -466,19 +484,50 @@ class _executer:
                 case "len": # Gets length
                     output = inst[2]
                     input_list = inst[3]
+                    if executer.resolve_var(input_list).type == "list":
+                        executer.write_var(output, executer.convert_to_var(len(executer.resolve_var(input_list).value)))
+                    else:
+                        executer.write_var(output, executer.convert_to_var(None))
+                case "index": # Gets the index of an item
+                    output = inst[2]
+                    input_list = inst[3]
+                    input_elem = executer.resolve_var(inst[4])
                     if input_list.type in ["identifier", "global_identifier"]:
                         var = executer.resolve_var(input_list)
                         lst = copy.deepcopy(var.value) if var.type == "list" else []
                     else:
                         lst = []
                     if executer.resolve_var(input_list).type == "list":
-                        executer.write_var(output, executer.convert_to_var(len(executer.resolve_var(input_list).value)))
+                        for index, elem in enumerate(lst):
+                            if elem.type == input_elem.type and elem.value == input_elem.value:
+                                executer.write_var(output, executer.convert_to_var(index))
+                                break
+                        else:
+                            executer.write_var(output, executer.convert_to_var(-1))
+                    else:
+                        executer.write_var(output, executer.convert_to_var(None))
+                case "in": # Checks if item is in list
+                    output = inst[2]
+                    input_list = inst[3]
+                    input_elem = executer.resolve_var(inst[4])
+                    if input_list.type in ["identifier", "global_identifier"]:
+                        var = executer.resolve_var(input_list)
+                        lst = copy.deepcopy(var.value) if var.type == "list" else []
+                    else:
+                        lst = []
+                    if executer.resolve_var(input_list).type == "list":
+                        for elem in lst:
+                            if elem.type == input_elem.type and elem.value == input_elem.value:
+                                executer.write_var(output, executer.convert_to_var(1))
+                                break
+                        else:
+                            executer.write_var(output, executer.convert_to_var(0))
                     else:
                         executer.write_var(output, executer.convert_to_var(None))
                 case _:
                     _error(f"Unknown list operation \"{inst[1].value}\"", inst[1])
         
-        def I_table(inst, executer): # Performs table operations ## TODO
+        def I_table(inst, executer): # Performs table operations
             match inst[1].value:
                 case "from": # Creates a table from sequential key value pairs
                     output_table = inst[2]
@@ -490,11 +539,9 @@ class _executer:
                         elem2 = inst.tokens[(i*2)+4]
                         key = executer.resolve_var(elem1)
                         value = executer.resolve_var(elem2)
-                        if key.type in ["identifier", "global_identifier"]:
-                            _error(f"Unable to write type '{value.type}' to table key", elem1)
-                        if value.type in ["identifier", "global_identifier"]:
-                            _error(f"Unable to write type '{value.type}' to table value", elem2)
-                        tbl[key.value] = value
+                        if key.type in ["list", "table"]:
+                            _error(f"Unable to write type '{key.type}' to table key", elem1)
+                        tbl[executer.convert_var_to_py(key)] = value
                     executer.write_var(output_table, executer.convert_to_var(tbl))
                 case "set": # Sets a key's value in a table
                     output_table = inst[2]
@@ -506,11 +553,9 @@ class _executer:
                         tbl = {}
                     key = executer.resolve_var(inst[4])
                     value = executer.resolve_var(inst[5])
-                    if key.type in ["identifier", "global_identifier"]:
+                    if key.type in ["list", "table"]:
                         _error(f"Unable to write type '{key.type}' to table key", inst[4])
-                    if value.type in ["identifier", "global_identifier"]:
-                        _error(f"Unable to write type '{value.type}' to table value", inst[5])
-                    tbl[key.value] = value
+                    tbl[executer.convert_var_to_py(key)] = value
                     executer.write_var(output_table, executer.convert_to_var(tbl))
                 case "get": # Gets a key's value in a table
                     output = inst[2]
@@ -522,7 +567,7 @@ class _executer:
                         tbl = {}
                     key = executer.resolve_var(inst[4])
                     try:
-                        executer.write_var(output, tbl[key.value])
+                        executer.write_var(output, tbl[executer.convert_var_to_py(key)])
                     except KeyError:
                         _error(f"Key '{key.value}' not found", inst[4])
                 case "del": # Removes a key
@@ -539,10 +584,21 @@ class _executer:
                     except KeyError:
                         _error(f"Key '{key.value}' not found", inst[4])
                     executer.write_var(output_table, executer.convert_to_var(tbl))
-                case "readjson": # Creates a table from a json string
-                    pass
-                case "writejson": # Creates a json string from a table
-                    pass
+                # json excluded for now because it's basically useless for sfmlog
+                #case "readjson": # Creates a table from a json string
+                #    output_table = inst[2]
+                #    input_str = executer.resolve_var(inst[3])
+                #    if input_str.type == "string":
+                #        executer.write_var(output_table, executer.convert_to_var(json.loads(input_str.value[1:-1]), expand_strings=True))
+                #case "writejson": # Creates a json string from a table
+                #    output_str = inst[2]
+                #    input_table = inst[3]
+                #    if input_table.type in ["identifier", "global_identifier"]:
+                #        var = executer.resolve_var(input_table)
+                #        tbl = copy.deepcopy(var.value) if var.type == "table" else {}
+                #    else:
+                #        tbl = {}
+                #    executer.write_var(output_str, executer.convert_to_var(json.dumps(executer.convert_var_to_py(executer.resolve_var(input_table)))))
                 case _:
                     _error(f"Unknown table operation \"{inst[1].value}\"", inst[1]) 
         
@@ -778,10 +834,11 @@ class _executer:
                 return _tokenizer.token("number", float(value))
             case str() as v if v[0] == '"' and v[-1] == '"':
                 return _tokenizer.token("string", value)
+                return _tokenizer.token("string", value.replace("\\\"", "\""))
             case str() as v if v[0] == '@':
                 return _tokenizer.token("content", value)
             case str():
-                return _tokenizer.token("string", '"' + value + '"')
+                return _tokenizer.token("string", '"' + value + '"' )
             case list():
                 lst = []
                 for item in value:
@@ -790,7 +847,7 @@ class _executer:
             case dict():
                 tbl = {}
                 for key, value in value.items():
-                    tbl[self.convert_to_var(key).value] = self.convert_to_var(value)
+                    tbl[self.convert_var_to_py(self.convert_to_var(key))] = self.convert_to_var(value)
                 return _tokenizer.token("table", tbl, exportable = False)
             case self.Macro():
                 return _tokenizer.token("macro", value, exportable = False)
@@ -799,7 +856,22 @@ class _executer:
             case _tokenizer.token():
                 return value
             case _:
-                raise Exception(f"Unhandled type {type(value)}")
+                raise Exception(f"Unhandled type '{type(value)}'")
+
+    def convert_var_to_py(self, var):
+        match var.type:
+            case ("number"|"content"|"identifier"|"global_identifier"|"block"):
+                return var.value
+            case "string":
+                return var.value[1:-1]
+            case ("null"|"macro"):
+                return None
+            case "list":
+                return [self.convert_var_to_py(x) for x in var.value]
+            case "table":
+                return {k: self.convert_var_to_py(v) for k, v in var.value.items()}
+            case _:
+                raise Exception(f"Unable to convert type '{var.type}'")
 
     def resolve_var(self, name: _tokenizer.token):
         if name.type == "identifier" and str(name) in self.vars:
@@ -970,11 +1042,22 @@ class _executer:
             case "strictEqual":
                 if input1.type != input2.type:
                     out = 0
-                out = a == b
+                else:
+                    out = a == b
+            case "in":
+                if input1.type != "list":
+                    out = 0
+                else:
+                    for elem in input1.value:
+                        if elem.type == input2.type and elem.value == input2.value:
+                            out = 1
+                            break
+                    else:
+                        out = 0
             case _:
                 _error(f"Unknown condition \"{operation.value}\"", operation)
 
-        return _tokenizer.token("number", float(out))
+        return self.convert_to_var(out)
 
     def init_instruction(self, keyword, exec_func):
         instruction = self.Instruction(keyword, exec_func)
