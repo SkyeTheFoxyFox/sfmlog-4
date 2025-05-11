@@ -6,11 +6,11 @@ def _error(text: str, token, executer):
         if cause[0].file is None:
             print(f"({cause[0].line},{cause[0].column})")
         else:
-            print(f"({cause[0].line},{cause[0].column}) in '{cause[0].file}'")
+            print(f"({cause[0].line},{cause[0].column}) in '{cause[0].file.resolve()}'")
     if token.file is None:
         print(f"({token.line},{token.column})")
     else:
-        print(f"({token.line},{token.column}) in '{token.file}'")
+        print(f"({token.line},{token.column}) in '{token.file.resolve()}'")
     sys.exit(2)
 
 def _warning(text: str, token, executer):
@@ -216,6 +216,8 @@ class _executer:
             self.exec_func: Callable = exec_func
 
     class Instructions:
+        BLOCK_INSTRUCTIONS = ["defmac", "proc", "if", "while", "for", "discard"]
+
         def init_instructions(executer):
             inst = _executer.Instructions
             executer.init_instruction("import", inst.I_import)
@@ -236,6 +238,7 @@ class _executer:
             executer.init_instruction("if", inst.I_if)
             executer.init_instruction("while", inst.I_while)
             executer.init_instruction("for", inst.I_for)
+            executer.init_instruction("discard", inst.I_discard)
             executer.init_instruction("log", inst.I_log)
             executer.init_instruction("error", inst.I_error)
 
@@ -280,16 +283,16 @@ class _executer:
                 if type(executer.resolve_var(inst[5]).value) != float:
                     _error("Expected numeric value", inst[5], executer)
                 block_rot = int(executer.resolve_var(inst[5]).value)
-
-            block = executer.schem_builder.Block(inst, block_type, executer, block_pos, block_rot)
-            link_name = executer.schem_builder.add_block(block)
-            executer.write_var(var_name, _tokenizer.token("block", link_name))
+            if executer.schem_builder is not None:
+                block = executer.schem_builder.Block(inst, block_type, executer, block_pos, block_rot)
+                link_name = executer.schem_builder.add_block(block)
+                executer.write_var(var_name, _tokenizer.token("block", link_name))
 
         def I_proc(inst, executer): # Adds a processor to the schematic
-            proc_code = executer.read_till("endproc", ["proc"])
+            proc_code = executer.read_till("end", _executer.Instructions.BLOCK_INSTRUCTIONS)
             if proc_code is None:
-                _error("'endproc' expected, but not found", inst[0], executer)
-            proc_executer = _executer(inst, proc_code, executer.cwd, executer.global_vars, "_", executer.schem_builder, executer.owners + [executer.spawn_instruction])
+                _error("'end' expected, but not found", inst[0], executer)
+            proc_executer = _executer(executer.spawn_instruction, proc_code, executer.cwd, executer.global_vars, "_", executer.schem_builder, executer.owners)
             proc_executer.macros = executer.macros
             proc_executer.execute()
             if 4 in inst:
@@ -306,14 +309,15 @@ class _executer:
                 pos = (int(executer.resolve_var(inst[3]).value), int(executer.resolve_var(inst[4]).value))
             else:
                 pos = None
-            proc_name = executer.schem_builder.add_proc(executer.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos, proc_type, executer, inst))
-            if 1 in inst:
-                executer.write_var(inst[1], _tokenizer.token("block", proc_name))
+            if executer.schem_builder is not None:
+                proc_name = executer.schem_builder.add_proc(executer.schem_builder.Proc(_tokenizer.token_list_to_str(proc_executer.output), pos, proc_type, executer, inst))
+                if 1 in inst:
+                    executer.write_var(inst[1], _tokenizer.token("block", proc_name))
 
         def I_defmac(inst, executer): # Defines a macro
-            mac_code = executer.read_till("endmac", ["defmac"])
+            mac_code = executer.read_till("end", _executer.Instructions.BLOCK_INSTRUCTIONS)
             if mac_code is None:
-                _error("'endmac' expected, but not found", inst[0], executer)
+                _error("'end' expected, but not found", inst[0], executer)
             if inst[1].type != "identifier":
                 _error("Invalid name for macro", inst[1], executer)
             mac_args = []
@@ -368,15 +372,36 @@ class _executer:
         def I_pop(inst, executer): # Performs math operations
             executer.write_var(inst[2], executer.eval_math(inst[1], executer.resolve_var(inst[3]), executer.resolve_var(inst[4])))
 
-        def I_strop(inst, executer): # Performs string operations ## TODO
+        def I_strop(inst, executer): # Performs string operations
             str_op = inst[1]
             str_out = inst[2]
             str_in = str(executer.convert_var_to_py(executer.resolve_var(inst[3])))
-            str_in2 = str(executer.convert_var_to_py(executer.resolve_var(inst[4])))
             out_val = ""
             match str_op.value:
                 case "cat":
+                    str_in2 = str(executer.convert_var_to_py(executer.resolve_var(inst[4])))
                     out_val = str_in + str_in2
+                case "num":
+                    try:
+                        out_val = float(str_in)
+                    except:
+                        _error("Unable to convert to number", inst[3])
+                case "int":
+                    try:
+                        out_val = str(int(executer.convert_var_to_py(executer.resolve_var(inst[3]))))
+                    except:
+                        out_val = None
+                case "substr":
+                    start = executer.resolve_var(inst[4])
+                    if start.type != "number":
+                        _error("Expected numeric value", inst[4])
+                    if 5 in inst:
+                        end = executer.resolve_var(inst[5])
+                        if end.type != "number":
+                            _error("Expected numeric value", inst[5])
+                        out_val = str_in[int(start.value):int(end.value)]
+                    else:
+                        out_val = str_in[int(start.value):]
             executer.write_var(str_out, executer.convert_to_var(out_val))
 
         def I_strlabel(inst, executer): # Creates a label from a string
@@ -386,7 +411,7 @@ class _executer:
             executer.output.append(_tokenizer.token("label", value.value[1:-1].replace(" ", "_") + ':').with_scope(executer.scope_str).at_token(inst[1]))
             executer.output.append(inst.tokens[-1])
 
-        def I_strvar(inst, executer): # Writes a variable name to a variable from a string ## TODO
+        def I_strvar(inst, executer): # Writes a variable name to a variable from a string
             var_out = inst[2]
             str_in = executer.resolve_var(inst[3])
             if str_in.type != "string":
@@ -398,6 +423,8 @@ class _executer:
                     token_type = "identifier"
                 case "global":
                     token_type = "global_identifier"
+                case "unscoped":
+                    token_type == "unscoped_identifier"
                 case _:
                     _error(f"Unknown variable context '{inst[1].value}'", executer)
 
@@ -607,9 +634,9 @@ class _executer:
                     _error(f"Unknown table operation \"{inst[1].value}\"", inst[1], executer) 
         
         def I_if(inst, executer): # Runs code depending on a condition
-            code_sections = executer.read_sections("endif", ["if"], ["elif", "else"])
+            code_sections = executer.read_sections("end", _executer.Instructions.BLOCK_INSTRUCTIONS, ["elif", "else"])
             if code_sections is None:
-                _error("'endif' expected, but not found", inst[0], executer)
+                _error("'end expected, but not found", inst[0], executer)
 
             for instruction, code_block in code_sections:
                 if instruction[0].value == "else" or executer.eval_condition(instruction[1], executer.resolve_var(instruction[2]), executer.resolve_var(instruction.option(3))).value:
@@ -623,9 +650,9 @@ class _executer:
                     break
         
         def I_while(inst, executer): # Loops code depending on a condition
-            code_block = executer.read_till("endwhile", ["while"])
+            code_block = executer.read_till("end", _executer.Instructions.BLOCK_INSTRUCTIONS)
             if code_block is None:
-                _error("'endwhile' expected, but not found", inst[0], executer)
+                _error("'end' expected, but not found", inst[0], executer)
             while executer.eval_condition(inst[1], executer.resolve_var(inst[2]), executer.resolve_var(inst.option(3))).value:
                 block_executer = _executer(executer.spawn_instruction, code_block, executer.cwd, executer.global_vars, executer.scope_str, executer.schem_builder, executer.owners)
                 block_executer.macros = executer.macros
@@ -636,9 +663,9 @@ class _executer:
                 executer.output.extend(block_executer.output)
         
         def I_for(inst, executer): # Loops code via iterator operations
-            code_block = executer.read_till("endfor", ["for"])
+            code_block = executer.read_till("end", _executer.Instructions.BLOCK_INSTRUCTIONS)
             if code_block is None:
-                _error("'endfor' expected, but not found", inst[0], executer)
+                _error("'end' expected, but not found", inst[0], executer)
             for_iter = None
             match inst[1].value:
                 case "range":
@@ -655,6 +682,11 @@ class _executer:
                     if lst.type != "list":
                         _error(f"Expected type 'list', got '{lst.type}'", inst[3], executer)
                     for_iter = iter(lst.value)
+                case "enumerate":
+                    lst = executer.resolve_var(inst[4])
+                    if lst.type != "list":
+                        _error(f"Expected type 'list', got '{lst.type}'", inst[4], executer)
+                    for_iter = iter(enumerate(lst.value))
                 case "table":
                     tbl = executer.resolve_var(inst[4])
                     if tbl.type != "table":
@@ -674,7 +706,20 @@ class _executer:
                 block_executer.macro_run_counts = executer.macro_run_counts
                 block_executer.execute()
                 executer.output.extend(block_executer.output)
-        
+
+        def I_discard(inst, executer): # Executes contained code in a sandbox, only writing out to arguments
+            code_block = executer.read_till("end", _executer.Instructions.BLOCK_INSTRUCTIONS)
+            if code_block is None:
+                _error("'end' expected, but not found", inst[0], executer)
+            block_executer = _executer(executer.spawn_instruction, code_block, executer.cwd, executer.global_vars.copy(), executer.scope_str, None, executer.owners)
+            block_executer.macros = executer.macros.copy()
+            block_executer.vars = executer.vars.copy()
+            block_executer.execute()
+            for arg in inst.tokens[1:-1]:
+                if arg.type not in ["identifier", "global_identifier"]:
+                    _error(f"Expected type 'identifier' or 'global_identifier' but got type '{arg.type}'", arg, executer)
+                executer.write_var(arg, block_executer.resolve_var(arg))
+            
         def I_log(inst, executer): # Writes out to the console
             print("".join(map(executer.resolve_log ,inst.tokens[1:-1])))
 
@@ -758,8 +803,9 @@ class _executer:
             if len(self.output) > 0 and not self.allow_mlog:
                 _error("Mlog instructions not allowed outside a 'proc' statement", inst[0], self)
             self.exec_pointer += 1
-        if self.allow_mlog and self.is_root and len(self.output) > 0:
-            self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(self.output), None, self.global_vars["global_PROCESSOR_TYPE"], None))
+        if self.allow_mlog and self.is_root and len(self.output) > 0 and self.schem_builder is not None:
+            self.schem_builder.add_proc(self.schem_builder.Proc(_tokenizer.token_list_to_str(self.output), None, self.global_vars["global_PROCESSOR_TYPE"], None, None))
+            print(_tokenizer.token_list_to_str(self.output))
         if self.is_root:
             self.schem_builder.processor_type = self.global_vars["global_PROCESSOR_TYPE"]
             self.schem_builder.set_name(self.resolve_log(self.global_vars["global_SCHEMATIC_NAME"]))
@@ -843,9 +889,11 @@ class _executer:
         match value:
             case (int() | float() | bool()):
                 return _tokenizer.token("number", float(value))
+            case str() as v if v == "":
+                return _tokenizer.token("string", value)
             case str() as v if v[0] == '"' and v[-1] == '"':
                 return _tokenizer.token("string", value)
-                return _tokenizer.token("string", value.replace("\\\"", "\""))
+                #return _tokenizer.token("string", value.replace("\\\"", "\""))
             case str() as v if v[0] == '@':
                 return _tokenizer.token("content", value)
             case str():
@@ -871,7 +919,7 @@ class _executer:
 
     def convert_var_to_py(self, var):
         match var.type:
-            case ("number"|"content"|"identifier"|"global_identifier"|"block"):
+            case ("number"|"content"|"identifier"|"global_identifier"|"unscoped_identifier"|"block"):
                 return var.value
             case "string":
                 return var.value[1:-1]
@@ -912,7 +960,8 @@ class _executer:
 
     def write_var(self, name: _tokenizer.token, value: _tokenizer.token):
         if name.type == "identifier":
-            self.vars[str(name)] = value
+            if name.value != '_':
+                self.vars[str(name)] = value
         elif name.type == "global_identifier":
             self.global_vars[str(name)] = value
         else:
@@ -1170,7 +1219,7 @@ class _schem_builder:
             else:
                 placed_block = self.schem.add_block(pymsch.Block(block_type, block.pos[0], block.pos[1], None, block.rotation))
                 if placed_block is None:
-                    _warning(f"Specified position at {block.pos} is blocked", block.inst[0])
+                    _warning(f"Specified position at {block.pos} is blocked", block.inst[0], block.type_exec)
 
     def schem_add_positioned_procs(self):
         procs = [x for x in self.procs if x.pos is not None]
@@ -1184,7 +1233,7 @@ class _schem_builder:
                 self.proc_positions.append(proc.pos)
                 self.placed_procs.append(block)
             else:
-                _warning(f"Specified position at {proc.pos} is blocked", proc.inst[0])
+                _warning(f"Specified position at {proc.pos} is blocked", proc.inst[0], proc.type_exec)
 
     def schem_add_unpositioned_procs(self):
         procs = [x for x in self.procs if x.pos is None]
